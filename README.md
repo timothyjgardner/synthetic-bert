@@ -13,6 +13,7 @@ This project generates a time series that mimics syllable-structured sequential 
 - **Fixed angular velocity per circle**, with periods ranging from 40 steps (fastest) to 400 steps (slowest) — a 10x speed range
 - **~400 step dwell time** per visit, achieved by varying the number of complete revolutions (quantised to whole laps so entry/exit angles are fixed)
 - **Sparse off-diagonal transition matrix** with ring connectivity plus long-range shortcuts
+- **Controllable geometric overlap** via the `--subspace-dim` flag (see below)
 
 ## Scripts
 
@@ -21,8 +22,35 @@ This project generates a time series that mimics syllable-structured sequential 
 Generates the Markov-switching circle time series with optional UMAP visualisation.
 
 ```bash
-python markov_circles_timeseries.py            # full run with UMAP
-python markov_circles_timeseries.py --no-umap  # skip UMAP (much faster)
+python markov_circles_timeseries.py                    # full run with UMAP
+python markov_circles_timeseries.py --no-umap          # skip UMAP (much faster)
+python markov_circles_timeseries.py --subspace-dim 4   # with geometric overlap
+```
+
+#### Subspace dimensionality (`--subspace-dim`)
+
+By default each circle's 2D plane is drawn independently from the full 20D ambient space. In high dimensions, random planes are nearly orthogonal, so the 10 circles occupy essentially non-overlapping subspaces and their noisy trajectories never cross.
+
+The `--subspace-dim` flag forces all circle planes into a shared subspace of the given dimension. Because there are only `subspace_dim` directions available, the 2D planes must share basis directions and the circles overlap geometrically. Combined with observation noise, this produces actual trajectory crossings in the ambient space.
+
+| `--subspace-dim` | Behaviour |
+|---|---|
+| **20** (or omitted) | Each circle's plane is drawn from the full 20D space. Planes are nearly orthogonal — **minimal overlap**. This is the default. |
+| **4–6** | All 10 circle planes are drawn from a 4–6D subspace. Planes share many directions — **significant overlap**. UMAP shows partially merged clusters with trajectories crossing between circles. |
+| **3** | 10 circles in 3D. Most plane pairs intersect along a line — **heavy overlap**. |
+| **2** | All circles are **coplanar** (same 2D plane). They become concentric rings separated only by their slightly different radii and noise. **Maximum overlap**. |
+
+This parameter is recorded in `data/config.json` for reproducibility. It also has a direct connection to intrinsic dimension estimation: the global Levina-Bickel dimension at intermediate k should approximate the `subspace_dim` value, since that is the true dimension of the subspace the circles collectively span.
+
+### `dataset.py`
+
+PyTorch `Dataset` for the synthetic-song time series. Loads `data/data.npz` and serves fixed-length sliding windows with patch-based masking, ready for a BERT-style masked prediction model.
+
+```python
+from dataset import SyntheticSongDataset
+
+ds = SyntheticSongDataset('data', seq_len=512)
+x, state, mask = ds[0]
 ```
 
 ### `estimate_dimension.py`
@@ -48,7 +76,9 @@ python levina_bickel_demo.py
 ![Markov circles time series](markov_circles_timeseries.png)
 
 **Top row:** Markov state sequence over time, sparse transition matrix, and per-circle period (steps per revolution).
-**Bottom row:** UMAP embedding coloured by circle index and by time step. Slow circles (long period) form coherent loops; fast circles appear as scattered points because consecutive time steps are far apart on the circle.
+**Bottom row:** UMAP embedding coloured by circle index and by time step.
+
+Note: this composite figure is regenerated each run and reflects whichever `--subspace-dim` was last used. See the [UMAP comparison section](#umap-embeddings-at-different-subspace-dimensions) for side-by-side images at specific subspace dimensions.
 
 ### Sample data windows
 
@@ -64,7 +94,7 @@ Raw 20-dimensional time series with state labels. Each column is one time step; 
 
 ![Dimension estimates](dimension_estimates.png)
 
-Levina-Bickel MLE intrinsic dimension estimates computed on 2000 subsampled points from the synthetic-song dataset (SNR ≈ 2.5).
+Levina-Bickel MLE intrinsic dimension estimates computed on 2000 subsampled points from the synthetic-song dataset (SNR ≈ 2.5, **subspace_dim = 20**, i.e. default / no overlap).
 
 There are two ways to measure the dimension of this dataset: **globally** (all points pooled together) and **per-circle** (only points from one circle at a time). These give very different answers, and the difference is informative.
 
@@ -98,6 +128,33 @@ When we restrict to points from a **single circle**, the estimator sees exactly 
 
 **Why the global and per-circle estimates differ:** The global estimate is higher because the Levina-Bickel estimator assumes data lies on a single smooth manifold. When the data is actually a *mixture* of manifolds in different sub-planes, neighbourhoods that mix points from different circles see a higher effective dimension — the dimension of the union, not any individual component. Restricting to one circle at a time eliminates this mixing and recovers the true per-manifold dimension.
 
+### UMAP embeddings at different subspace dimensions
+
+The standalone UMAP plots below show how the `--subspace-dim` parameter affects the geometric structure of the data, along with Levina-Bickel dimension estimates computed directly in the 2D UMAP space.
+
+#### subspace_dim = 20 (no overlap — default)
+
+![UMAP subspace 20](umap_subspace_20.png)
+
+With the full 20D ambient space available, each circle's 2D plane is nearly orthogonal to every other. UMAP cleanly separates all 10 circles into distinct, well-isolated clusters. The Levina-Bickel dimension in UMAP space drops from ~2.25 (k=10) to ~1.31 (k=100): at large neighbourhood scales the estimator sees essentially 1D curves (circles mapped to loops), with no inter-circle contamination.
+
+#### subspace_dim = 4 (significant overlap)
+
+![UMAP subspace 4](umap_subspace_4.png)
+
+When all 10 circle planes are drawn from a shared 4D subspace, planes must share basis directions and the circles overlap geometrically in the ambient space. UMAP can no longer fully separate them — clusters merge and trajectories from different circles intermingle. The Levina-Bickel dimension in UMAP space stays higher: ~2.27 (k=10) to ~1.94 (k=100). The estimate remains close to 2 even at large k because the overlapping circles fill the 2D UMAP plane more uniformly, making the embedding look like a surface rather than a collection of isolated curves.
+
+#### Comparison
+
+| Metric | subspace_dim=20 | subspace_dim=4 |
+|---|---|---|
+| LB dim (k=10) | 2.25 | 2.27 |
+| LB dim (k=30) | 1.79 | 2.07 |
+| LB dim (k=100) | 1.31 | 1.94 |
+| UMAP separation | Clean, isolated clusters | Merged, overlapping clusters |
+
+The key takeaway: reducing the subspace dimension increases geometric overlap between circles, which UMAP reflects as merged clusters and the Levina-Bickel estimator reflects as higher effective dimension in the embedding space. At k=100, the jump from 1.31 to 1.94 directly measures how much the overlap fills the UMAP plane.
+
 ### Levina-Bickel demo (single noisy circle)
 
 ![Levina-Bickel results](levina_bickel_results.png)
@@ -111,6 +168,7 @@ numpy
 scipy
 matplotlib
 umap-learn
+torch        # optional, only needed for dataset.py
 ```
 
 Install into a virtual environment:
@@ -119,4 +177,5 @@ Install into a virtual environment:
 python -m venv venv
 source venv/bin/activate
 pip install numpy scipy matplotlib umap-learn
+pip install torch  # optional, for the PyTorch data loader
 ```

@@ -22,6 +22,17 @@ The model visits one circle at a time as a "syllable":
   4. On exit, choose the next circle from the off-diagonal entries of a
      sparse transition matrix (ring + shortcut connectivity, zero
      diagonal).
+
+Overlap control  (--subspace-dim)
+---------------------------------
+By default each circle's 2D plane is drawn from the full 20D ambient
+space, so planes are nearly orthogonal and trajectories don't overlap.
+The ``--subspace-dim`` flag restricts all planes to a shared subspace
+of the given dimension, forcing geometric overlap:
+
+    --subspace-dim 20   (default) minimal overlap — planes span full 20D
+    --subspace-dim 4    significant overlap — 10 circles in 4D
+    --subspace-dim 2    maximum overlap — all circles coplanar
 """
 
 import json
@@ -37,7 +48,7 @@ import umap
 # ---------------------------------------------------------------------------
 
 def create_circles(n_circles=10, ambient_dim=20, radius_mean=3.0,
-                    radius_std=0.3, seed=42):
+                    radius_std=0.3, subspace_dim=None, seed=42):
     """
     Define n_circles circles in high-dimensional ambient space.
 
@@ -49,6 +60,33 @@ def create_circles(n_circles=10, ambient_dim=20, radius_mean=3.0,
     circular signal spans the ambient dimensions (e.g. 20.0 for a
     20-dimensional space, giving per-dimension amplitude ~20/√20 ≈ 4.5).
 
+    Parameters
+    ----------
+    n_circles : int
+        Number of circles.
+    ambient_dim : int
+        Dimension of the ambient space.
+    radius_mean : float
+        Mean radius for all circles.
+    radius_std : float
+        Std-dev of the radius distribution.
+    subspace_dim : int or None
+        Dimension of the subspace from which circle planes are drawn.
+        Controls geometric overlap between circles:
+
+        - ``None`` or ``ambient_dim`` (default): each circle's 2D plane
+          is drawn from the full ambient space.  In high dimensions the
+          planes are nearly orthogonal and trajectories barely overlap.
+        - ``2``: all circles share the *same* 2D plane — maximum overlap
+          (concentric rings with noise bleeding across).
+        - ``3–6``: circles are forced into a small subspace and their
+          planes significantly overlap, producing actual trajectory
+          crossings once noise is added.
+
+        Range: 2 ≤ subspace_dim ≤ ambient_dim.
+    seed : int
+        Random seed for reproducibility.
+
     Returns
     -------
     radii : ndarray (n_circles,)
@@ -57,18 +95,43 @@ def create_circles(n_circles=10, ambient_dim=20, radius_mean=3.0,
     """
     rng = np.random.default_rng(seed)
 
+    if subspace_dim is None:
+        subspace_dim = ambient_dim
+    subspace_dim = max(2, min(subspace_dim, ambient_dim))
+
     # Similar radii drawn from a tight distribution
     radii = rng.normal(radius_mean, radius_std, n_circles)
     radii = np.clip(radii, radius_mean * 0.5, radius_mean * 1.5)  # safety
 
+    # If subspace_dim < ambient_dim, generate a random orthonormal basis
+    # that spans a subspace_dim-dimensional subspace of R^ambient_dim.
+    # All circle planes will be drawn from within this subspace, forcing
+    # geometric overlap.
+    if subspace_dim < ambient_dim:
+        M = rng.standard_normal((ambient_dim, subspace_dim))
+        Q, _ = np.linalg.qr(M)
+        subspace_basis = Q  # shape (ambient_dim, subspace_dim)
+    else:
+        subspace_basis = None  # full ambient space — no projection needed
+
     planes = []
     for _ in range(n_circles):
-        # Random orthonormal 2D basis via Gram-Schmidt
-        v1 = rng.standard_normal(ambient_dim)
-        v1 /= np.linalg.norm(v1)
-        v2 = rng.standard_normal(ambient_dim)
-        v2 -= v2.dot(v1) * v1
-        v2 /= np.linalg.norm(v2)
+        if subspace_basis is not None:
+            # Draw a 2D plane within the restricted subspace
+            c1 = rng.standard_normal(subspace_dim)
+            v1 = subspace_basis @ c1
+            v1 /= np.linalg.norm(v1)
+            c2 = rng.standard_normal(subspace_dim)
+            v2 = subspace_basis @ c2
+            v2 -= v2.dot(v1) * v1
+            v2 /= np.linalg.norm(v2)
+        else:
+            # Full ambient space (original behaviour)
+            v1 = rng.standard_normal(ambient_dim)
+            v1 /= np.linalg.norm(v1)
+            v2 = rng.standard_normal(ambient_dim)
+            v2 -= v2.dot(v1) * v1
+            v2 /= np.linalg.norm(v2)
         planes.append((v1, v2))
 
     # Shared center at the origin for all circles
@@ -148,6 +211,7 @@ def generate_time_series(
     dwell_std=100,
     min_period=40,
     max_period=400,
+    subspace_dim=None,
     seed=42,
 ):
     """
@@ -186,6 +250,10 @@ def generate_time_series(
         Steps per revolution for the fastest circle.
     max_period : int
         Steps per revolution for the slowest circle.
+    subspace_dim : int or None
+        Dimension of the subspace from which circle planes are drawn.
+        Controls geometric overlap (see ``create_circles`` docstring).
+        None or ambient_dim = no overlap; 2 = maximum overlap.
     seed : int
         Random seed for reproducibility.
 
@@ -202,7 +270,8 @@ def generate_time_series(
     rng = np.random.default_rng(seed)
 
     radii, planes, centers = create_circles(
-        n_circles, ambient_dim, radius_mean, radius_std, seed
+        n_circles, ambient_dim, radius_mean, radius_std,
+        subspace_dim=subspace_dim, seed=seed,
     )
     T = create_sparse_transition_matrix(n_circles, seed)
 
@@ -306,6 +375,11 @@ def save_dataset(out_dir, X, states, thetas, T, radii, entry_angles, periods,
 # Noise level: noise_std ≈ 2.83.
 # Signal power per dimension ≈ radius_mean² / ambient_dim = 400/20 = 20.
 # SNR = signal_power / noise_std² = 20 / 8 ≈ 2.5.
+#
+# subspace_dim: controls geometric overlap between circle planes.
+#   None or 20 → planes drawn from full 20D (minimal overlap, default).
+#   3–6        → significant overlap, trajectories cross with noise.
+#   2          → all circles coplanar (maximum overlap).
 DEFAULT_CONFIG = dict(
     n_steps=100000,
     n_circles=10,
@@ -317,6 +391,7 @@ DEFAULT_CONFIG = dict(
     dwell_std=100,
     min_period=40,
     max_period=400,
+    subspace_dim=None,
     seed=42,
 )
 
@@ -415,6 +490,56 @@ def main(run_umap=True):
     plt.savefig('markov_circles_timeseries.png', dpi=150, bbox_inches='tight')
     plt.close()
 
+    # ---- Standalone UMAP figure ----
+    if run_umap:
+        from estimate_dimension import levina_bickel_estimator
+
+        sdim = config.get('subspace_dim')
+        if sdim is None:
+            sdim = config['ambient_dim']
+
+        # Levina-Bickel on the 2D UMAP embedding at several k values
+        lb_ks = [10, 30, 100]
+        lb_results = {}
+        print("Computing Levina-Bickel on UMAP embedding...")
+        for k in lb_ks:
+            m_hat, _ = levina_bickel_estimator(X_umap, k)
+            lb_results[k] = m_hat
+        lb_str = '  '.join(f'k={k}: {lb_results[k]:.2f}' for k in lb_ks)
+        print(f"  LB dimension in UMAP space:  {lb_str}")
+
+        title = (f'UMAP — {config["n_circles"]} circles in '
+                 f'{config["ambient_dim"]}D  '
+                 f'(subspace dim = {sdim})')
+        subtitle = f'Levina-Bickel dim in UMAP space:  {lb_str}'
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+        sc1 = ax1.scatter(X_umap[:, 0], X_umap[:, 1], c=states_sub,
+                          cmap='tab10', s=3, alpha=0.5)
+        ax1.set_xlabel('UMAP 1')
+        ax1.set_ylabel('UMAP 2')
+        ax1.set_title('Coloured by circle')
+        cbar1 = plt.colorbar(sc1, ax=ax1, label='Circle index')
+        cbar1.set_ticks(range(config['n_circles']))
+        ax1.grid(True, alpha=0.2)
+
+        sc2 = ax2.scatter(X_umap[:, 0], X_umap[:, 1], c=idx,
+                          cmap='viridis', s=3, alpha=0.5)
+        ax2.set_xlabel('UMAP 1')
+        ax2.set_ylabel('UMAP 2')
+        ax2.set_title('Coloured by time')
+        plt.colorbar(sc2, ax=ax2, label='Time step')
+        ax2.grid(True, alpha=0.2)
+
+        fig.suptitle(title + '\n' + subtitle, fontsize=13, fontweight='bold',
+                     y=1.04)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        fname = f'umap_subspace_{sdim}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved {fname}")
+
     # ---- Sample data images: raw dimensions vs time ----
     # Evenly spaced windows: beginning, middle, end of the time series
     n_samples = 3
@@ -507,8 +632,16 @@ def main(run_umap=True):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='Generate a Markov-switching time series on circles.')
     parser.add_argument('--no-umap', action='store_true',
                         help='Skip the UMAP embedding (much faster)')
+    parser.add_argument('--subspace-dim', type=int, default=None,
+                        help='Dimension of the subspace from which circle '
+                             'planes are drawn.  Controls geometric overlap: '
+                             '20 (default) = no overlap, 4 = significant, '
+                             '2 = maximum.  Range: 2..ambient_dim.')
     args = parser.parse_args()
+    if args.subspace_dim is not None:
+        DEFAULT_CONFIG['subspace_dim'] = args.subspace_dim
     main(run_umap=not args.no_umap)
