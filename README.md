@@ -66,7 +66,9 @@ Raw 20-dimensional time series with state labels. Each column is one time step; 
 
 Levina-Bickel MLE intrinsic dimension estimates computed on 2000 subsampled points from the synthetic-song dataset (SNR ≈ 2.5).
 
-**Left — Global dimension vs k:**
+There are two ways to measure the dimension of this dataset: **globally** (all points pooled together) and **per-circle** (only points from one circle at a time). These give very different answers, and the difference is informative.
+
+**Left — Global dimension vs k (all circles pooled):**
 
 | k | Estimated dimension |
 |---|---|
@@ -77,11 +79,24 @@ Levina-Bickel MLE intrinsic dimension estimates computed on 2000 subsampled poin
 | 100 | 6.6 |
 | 200 | 7.2 |
 
-At small k, noise dominates and the estimate inflates toward the ambient dimension (20). At intermediate k (~75–100), the estimate bottoms out around ~6.6. At large k, estimates rise as points from different circles start mixing.
+When all 10 circles are pooled, the estimator sees a **mixture of 10 different 2D sub-planes** in 20D space, plus noise. This is not a single 2-dimensional manifold — it is a union of manifolds that collectively span a higher-dimensional subspace. The global estimate bottoms out around ~6.6, reflecting this multi-manifold structure:
+
+- **Small k (5–20):** Neighbourhoods are dominated by noise, which is isotropic in all 20 dimensions. The estimate inflates toward the ambient dimension (20).
+- **Intermediate k (50–100):** Neighbourhoods are large enough to average out noise but still mostly sample from a single circle. The estimate reaches a minimum (~6.6), which exceeds 2 because some neighbourhoods straddle transitions between circles that lie in different 2D sub-planes.
+- **Large k (150–200):** Neighbourhoods span points from multiple circles in different sub-planes. The union of several 2D sub-planes spans an increasingly high-dimensional subspace, pushing the estimate back up.
 
 **Right — Per-circle dimension at selected k values:**
 
-At k=100, all circles converge to ~2.5–3.5, close to the true manifold dimension of 2 (each circle lives in a 2D sub-plane). The excess above 2 comes from the observation noise. The estimates are consistent across circles regardless of traversal speed — intrinsic dimension is a geometric property of the manifold, not the dynamics.
+| Circle | Period | k=10 | k=30 | k=100 |
+|--------|--------|------|------|-------|
+| 0 | 40 | 11.3 | 7.2 | 2.8 |
+| 1 | 80 | 11.3 | 7.3 | 3.0 |
+| 5 | 240 | 12.3 | 8.3 | 3.4 |
+| 9 | 400 | 10.7 | 6.4 | 2.7 |
+
+When we restrict to points from a **single circle**, the estimator sees exactly one 2D sub-plane plus noise. At k=100, all circles converge to ~2.5–3.5, close to the true manifold dimension of 2. The residual above 2 comes from observation noise inflating the local dimension estimate.
+
+**Why the global and per-circle estimates differ:** The global estimate is higher because the Levina-Bickel estimator assumes data lies on a single smooth manifold. When the data is actually a *mixture* of manifolds in different sub-planes, neighbourhoods that mix points from different circles see a higher effective dimension — the dimension of the union, not any individual component. Restricting to one circle at a time eliminates this mixing and recovers the true per-manifold dimension.
 
 ### Levina-Bickel demo (single noisy circle)
 
