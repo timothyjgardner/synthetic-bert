@@ -157,6 +157,33 @@ class MaskedTimeSeriesBERT(nn.Module):
         pred = self.output_proj(h)
         return pred
 
+    @torch.no_grad()
+    def encode(self, x):
+        """
+        Run input through the model *without masking* and return the
+        intermediate representation at every transformer layer.
+
+        Parameters
+        ----------
+        x : (batch, seq_len, feature_dim) – observations (no masking)
+
+        Returns
+        -------
+        layer_outputs : list of (batch, seq_len, d_model)
+            One tensor per transformer layer (len = n_layers).
+            layer_outputs[0] is after the first encoder layer,
+            layer_outputs[-1] is the final encoder output.
+        """
+        h = self.input_proj(x)
+        h = self.pos_enc(h)
+
+        layer_outputs = []
+        for layer in self.transformer.layers:
+            h = layer(h)
+            layer_outputs.append(h)
+
+        return layer_outputs
+
 
 # ---------------------------------------------------------------------------
 # Loss
@@ -325,22 +352,41 @@ def visualize_predictions(model, dataset, device, n_samples=3, save_dir='.'):
 # Training loss curve
 # ---------------------------------------------------------------------------
 
-def plot_loss_curve(train_losses, val_losses, save_path='training_loss.png'):
+def plot_loss_curve(train_losses, val_losses, lrs=None,
+                    save_path='training_loss.png'):
     """Save a training/validation loss curve plot."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax1 = plt.subplots(figsize=(8, 5))
     epochs = range(1, len(train_losses) + 1)
-    ax.plot(epochs, train_losses, label='Train MSE', linewidth=2)
-    ax.plot(epochs, val_losses, label='Val MSE', linewidth=2)
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Masked MSE Loss')
-    ax.set_title('Training Progress')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_yscale('log')
+    ax1.plot(epochs, train_losses, label='Train MSE', linewidth=2)
+    ax1.plot(epochs, val_losses, label='Val MSE', linewidth=2)
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Masked MSE Loss')
+    ax1.set_title('Training Progress')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yscale('log')
+
+    if lrs is not None:
+        ax2 = ax1.twinx()
+        ax2.plot(epochs, lrs, color='grey', linewidth=1, alpha=0.5,
+                 linestyle='--', label='LR')
+        ax2.set_ylabel('Learning Rate', color='grey')
+        ax2.tick_params(axis='y', labelcolor='grey')
+        ax2.legend(loc='center right')
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved {save_path}")
+
+
+def append_to_log(log_path, epoch, train_loss, val_loss, lr, is_best):
+    """Append one line to the CSV training log."""
+    write_header = not Path(log_path).exists()
+    with open(log_path, 'a') as f:
+        if write_header:
+            f.write('epoch,train_mse,val_mse,lr,best\n')
+        f.write(f'{epoch},{train_loss:.6f},{val_loss:.6f},'
+                f'{lr:.8f},{"*" if is_best else ""}\n')
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +402,7 @@ def main():
                         help='Directory containing data.npz and config.json')
     parser.add_argument('--seq-len', type=int, default=512,
                         help='Sequence length per window')
-    parser.add_argument('--stride', type=int, default=256,
+    parser.add_argument('--stride', type=int, default=128,
                         help='Stride between windows')
     parser.add_argument('--mask-ratio', type=float, default=0.15,
                         help='Fraction of time steps to mask')
@@ -376,9 +422,11 @@ def main():
     # Training
     parser.add_argument('--batch-size', type=int, default=32,
                         help='Training batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate')
-    parser.add_argument('--epochs', type=int, default=50,
+    parser.add_argument('--lr', type=float, default=3e-4,
+                        help='Peak learning rate')
+    parser.add_argument('--warmup-epochs', type=int, default=20,
+                        help='Number of linear warmup epochs')
+    parser.add_argument('--epochs', type=int, default=500,
                         help='Number of training epochs')
     parser.add_argument('--val-fraction', type=float, default=0.1,
                         help='Fraction of data for validation')
@@ -466,16 +514,32 @@ def main():
         visualize_predictions(model, viz_ds, device, n_samples=3)
         return
 
-    # ---- Optimizer & scheduler ----
+    # ---- Optimizer & scheduler (linear warmup + cosine decay) ----
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0,
+        total_iters=args.warmup_epochs,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - args.warmup_epochs,
+        eta_min=args.lr * 0.01,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[args.warmup_epochs],
     )
 
     # ---- Training loop ----
     best_val = float('inf')
-    train_losses, val_losses = [], []
+    train_losses, val_losses, lrs = [], [], []
+    log_path = 'training_log.csv'
+    plot_every = 25  # update loss curve plot every N epochs
+
+    # Remove stale log from a previous run
+    if Path(log_path).exists():
+        Path(log_path).unlink()
 
     print(f"\n{'Epoch':<7} {'Train MSE':<12} {'Val MSE':<12} "
           f"{'LR':<12} {'Best'}")
@@ -489,6 +553,7 @@ def main():
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
+        lrs.append(lr)
 
         is_best = val_loss < best_val
         if is_best:
@@ -502,15 +567,22 @@ def main():
                 'args': vars(args),
             }, args.checkpoint)
 
+        # CSV log (every epoch)
+        append_to_log(log_path, epoch, train_loss, val_loss, lr, is_best)
+
+        # Console output (selective)
         marker = ' *' if is_best else ''
-        print(f"{epoch:<7} {train_loss:<12.4f} {val_loss:<12.4f} "
-              f"{lr:<12.6f}{marker}")
+        if epoch <= 5 or epoch % 10 == 0 or is_best or epoch == args.epochs:
+            print(f"{epoch:<7} {train_loss:<12.4f} {val_loss:<12.4f} "
+                  f"{lr:<12.6f}{marker}")
+
+        # Periodic loss curve update
+        if epoch % plot_every == 0 or epoch == args.epochs:
+            plot_loss_curve(train_losses, val_losses, lrs)
 
     print(f"\nBest val MSE: {best_val:.4f}")
     print(f"Checkpoint saved to {args.checkpoint}")
-
-    # ---- Loss curve ----
-    plot_loss_curve(train_losses, val_losses)
+    print(f"Training log saved to {log_path}")
 
     # ---- Visualize with best model ----
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
