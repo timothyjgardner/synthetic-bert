@@ -25,9 +25,17 @@ python markov_circles_timeseries.py            # full run with UMAP
 python markov_circles_timeseries.py --no-umap  # skip UMAP (much faster)
 ```
 
+### `estimate_dimension.py`
+
+Runs the Levina-Bickel MLE dimension estimator on the saved synthetic-song dataset at various k values, both globally and per-circle.
+
+```bash
+python estimate_dimension.py
+```
+
 ### `levina_bickel_demo.py`
 
-Demonstrates the Levina-Bickel MLE intrinsic dimension estimator on a noisy circle, showing how the estimate depends on the neighbourhood scale `k` and noise level.
+Demonstrates the Levina-Bickel MLE intrinsic dimension estimator on a single noisy circle, showing how the estimate depends on the neighbourhood scale `k` and noise level.
 
 ```bash
 python levina_bickel_demo.py
@@ -52,11 +60,34 @@ Raw 20-dimensional time series with state labels. Each column is one time step; 
 
 ![Sample window 2](sample_window_2.png)
 
-### Levina-Bickel dimension estimation
+### Dimension estimation on the synthetic-song dataset
+
+![Dimension estimates](dimension_estimates.png)
+
+Levina-Bickel MLE intrinsic dimension estimates computed on 2000 subsampled points from the synthetic-song dataset (SNR ≈ 2.5).
+
+**Left — Global dimension vs k:**
+
+| k | Estimated dimension |
+|---|---|
+| 5 | 15.3 |
+| 10 | 11.7 |
+| 20 | 9.3 |
+| 50 | 6.9 |
+| 100 | 6.6 |
+| 200 | 7.2 |
+
+At small k, noise dominates and the estimate inflates toward the ambient dimension (20). At intermediate k (~75–100), the estimate bottoms out around ~6.6. At large k, estimates rise as points from different circles start mixing.
+
+**Right — Per-circle dimension at selected k values:**
+
+At k=100, all circles converge to ~2.5–3.5, close to the true manifold dimension of 2 (each circle lives in a 2D sub-plane). The excess above 2 comes from the observation noise. The estimates are consistent across circles regardless of traversal speed — intrinsic dimension is a geometric property of the manifold, not the dynamics.
+
+### Levina-Bickel demo (single noisy circle)
 
 ![Levina-Bickel results](levina_bickel_results.png)
 
-Estimated intrinsic dimension vs neighbourhood size `k` for a circle in 10D with varying noise levels. Without noise the estimator correctly finds dimension ~1. With noise, small `k` overestimates (noise dominates) and large `k` recovers the manifold.
+Estimated intrinsic dimension vs neighbourhood size `k` for a single circle in 10D with varying noise levels. Without noise the estimator correctly finds dimension ~1. With noise, small `k` overestimates (noise dominates) and large `k` recovers the manifold.
 
 ## Requirements
 

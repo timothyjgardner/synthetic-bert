@@ -24,6 +24,9 @@ The model visits one circle at a time as a "syllable":
      diagonal).
 """
 
+import json
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import umap
@@ -254,31 +257,97 @@ def generate_time_series(
 
 
 # ---------------------------------------------------------------------------
+# Data saving
+# ---------------------------------------------------------------------------
+
+def save_dataset(out_dir, X, states, thetas, T, radii, entry_angles, periods,
+                 config):
+    """
+    Save the generated time series to disk.
+
+    Files written
+    -------------
+    {out_dir}/data.npz
+        Arrays: X (n_steps, ambient_dim), states (n_steps,),
+        thetas (n_steps,), transition_matrix (n_circles, n_circles),
+        radii (n_circles,), entry_angles (n_circles,),
+        periods (n_circles,).
+    {out_dir}/config.json
+        Generation parameters (seed, dimensions, dwell stats, etc.)
+        so the dataset is fully reproducible.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        out / 'data.npz',
+        X=X,
+        states=states,
+        thetas=thetas,
+        transition_matrix=T,
+        radii=radii,
+        entry_angles=entry_angles,
+        periods=periods,
+    )
+
+    with open(out / 'config.json', 'w') as f:
+        json.dump(config, f, indent=2)
+
+    print(f"Saved dataset to {out}/  "
+          f"(data.npz: {X.nbytes / 1e6:.1f} MB, config.json)")
+
+
+# ---------------------------------------------------------------------------
 # Visualization & summary
 # ---------------------------------------------------------------------------
 
+# Default generation parameters (single source of truth)
+#
+# Noise level: noise_std ≈ 2.83.
+# Signal power per dimension ≈ radius_mean² / ambient_dim = 400/20 = 20.
+# SNR = signal_power / noise_std² = 20 / 8 ≈ 2.5.
+DEFAULT_CONFIG = dict(
+    n_steps=100000,
+    n_circles=10,
+    ambient_dim=20,
+    radius_mean=20.0,
+    radius_std=2.0,
+    noise_std=2.83,
+    dwell_mean=400,
+    dwell_std=100,
+    min_period=40,
+    max_period=400,
+    seed=42,
+)
+
+
 def main(run_umap=True):
     # ---- generate data ----
+    config = DEFAULT_CONFIG.copy()
     X, states, thetas, T, radii, entry_angles, periods = generate_time_series(
-        n_steps=100000,
-        n_circles=10,
-        ambient_dim=20,
-        radius_mean=20.0,
-        radius_std=2.0,
-        noise_std=0.1,
-        dwell_mean=400,
-        dwell_std=100,
-        min_period=40,
-        max_period=400,
-        seed=42,
+        **config
     )
 
-    # ---- UMAP embedding (optional) ----
+    # ---- save dataset ----
+    save_dataset('data', X, states, thetas, T, radii, entry_angles, periods,
+                 config)
+
+    # ---- UMAP embedding (optional, on a subsample for speed) ----
+    umap_max_points = 10000
     if run_umap:
-        print("Computing UMAP embedding...")
-        reducer = umap.UMAP(n_neighbors=200, min_dist=0.3, metric='euclidean',
+        if len(X) > umap_max_points:
+            idx = np.random.default_rng(42).choice(
+                len(X), umap_max_points, replace=False)
+            idx.sort()
+            X_sub, states_sub = X[idx], states[idx]
+            print(f"Computing UMAP on {umap_max_points} / {len(X)} points...")
+        else:
+            X_sub, states_sub = X, states
+            idx = np.arange(len(X))
+            print("Computing UMAP embedding...")
+        reducer = umap.UMAP(n_neighbors=50, min_dist=0.3, metric='euclidean',
                             random_state=42)
-        X_umap = reducer.fit_transform(X)
+        X_umap = reducer.fit_transform(X_sub)
 
     # ---- figure ----
     if run_umap:
@@ -323,8 +392,8 @@ def main(run_umap=True):
     if run_umap:
         # (d) UMAP coloured by circle state (bottom-left, wide)
         ax = fig.add_subplot(gs[1, 0:2])
-        sc = ax.scatter(X_umap[:, 0], X_umap[:, 1], c=states, cmap='tab10',
-                        s=3, alpha=0.5)
+        sc = ax.scatter(X_umap[:, 0], X_umap[:, 1], c=states_sub,
+                        cmap='tab10', s=3, alpha=0.5)
         ax.set_xlabel('UMAP 1')
         ax.set_ylabel('UMAP 2')
         ax.set_title('UMAP Embedding (coloured by circle)')
@@ -334,7 +403,7 @@ def main(run_umap=True):
 
         # (e) UMAP coloured by time (bottom-right)
         ax = fig.add_subplot(gs[1, 2])
-        sc2 = ax.scatter(X_umap[:, 0], X_umap[:, 1], c=np.arange(len(states)),
+        sc2 = ax.scatter(X_umap[:, 0], X_umap[:, 1], c=idx,
                          cmap='viridis', s=3, alpha=0.5)
         ax.set_xlabel('UMAP 1')
         ax.set_ylabel('UMAP 2')
