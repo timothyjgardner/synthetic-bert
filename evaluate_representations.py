@@ -8,9 +8,12 @@ intrinsic dimension estimates on each layer's representation.
 
 Usage
 -----
-    python evaluate_representations.py                        # defaults
+    python evaluate_representations.py                        # all layers
     python evaluate_representations.py --checkpoint best.pt   # custom ckpt
     python evaluate_representations.py --no-lb                # skip LB
+    python evaluate_representations.py --layers 7             # layer 7 only
+    python evaluate_representations.py --layers 1,4,7,output  # specific layers
+    python evaluate_representations.py --layers input,7,output # with input
 """
 
 import argparse
@@ -114,6 +117,12 @@ def main():
                         help='Skip Levina-Bickel dimension estimates')
     parser.add_argument('--lb-points', type=int, default=2000,
                         help='Points to subsample for Levina-Bickel')
+    parser.add_argument('--layers', type=str, default=None,
+                        help='Comma-separated list of layers to visualise. '
+                             'Use integers for transformer layers (1-based), '
+                             '"input" for raw input, "output" for output '
+                             'projection.  E.g. --layers input,4,7,output. '
+                             'Default: all layers.')
     args = parser.parse_args()
 
     device = torch.device(
@@ -150,6 +159,40 @@ def main():
     print(f"  Encoder layers: {layer_reps[0].shape}")
     print(f"  Output projection: {layer_reps[-1].shape}")
 
+    # ---- Parse --layers filter ----
+    # Build the full list of available panels: input, layer_1..N, output
+    all_panel_keys = ['input']
+    for i in range(n_encoder_layers):
+        all_panel_keys.append(f'layer_{i+1}')
+    all_panel_keys.append('output')
+
+    if args.layers is not None:
+        selected_keys = []
+        for token in args.layers.split(','):
+            token = token.strip().lower()
+            if token == 'input':
+                selected_keys.append('input')
+            elif token == 'output':
+                selected_keys.append('output')
+            else:
+                try:
+                    layer_num = int(token)
+                    key = f'layer_{layer_num}'
+                    if key not in all_panel_keys:
+                        print(f"WARNING: layer {layer_num} does not exist "
+                              f"(model has {n_encoder_layers} layers), skipping")
+                    else:
+                        selected_keys.append(key)
+                except ValueError:
+                    print(f"WARNING: unrecognised layer '{token}', skipping")
+        if not selected_keys:
+            print("No valid layers selected, falling back to all layers.")
+            selected_keys = all_panel_keys
+    else:
+        selected_keys = all_panel_keys
+
+    print(f"Visualising: {', '.join(selected_keys)}")
+
     # ---- Subsample for UMAP ----
     rng = np.random.default_rng(42)
     if n_used > args.umap_points:
@@ -160,53 +203,58 @@ def main():
 
     states_sub = states_used[idx]
 
-    # ---- Levina-Bickel on each layer (optional) ----
+    # ---- Build panel data for selected layers ----
+    def get_panel_data(key):
+        """Return (title, data_subsampled, key) for a given panel key."""
+        if key == 'input':
+            return (f'Input ({X.shape[1]}D)', X[idx].astype(np.float32), key)
+        elif key == 'output':
+            return (f'Output ({layer_reps[-1].shape[1]}D)',
+                    layer_reps[-1][idx], key)
+        else:
+            # layer_N → index N-1
+            layer_i = int(key.split('_')[1]) - 1
+            return (f'Layer {layer_i+1} ({layer_reps[layer_i].shape[1]}D)',
+                    layer_reps[layer_i][idx], key)
+
+    def get_lb_data(key):
+        """Return data for Levina-Bickel for a given panel key."""
+        if key == 'input':
+            return X[lb_idx].astype(np.float32)
+        elif key == 'output':
+            return layer_reps[-1][lb_idx]
+        else:
+            layer_i = int(key.split('_')[1]) - 1
+            return layer_reps[layer_i][lb_idx]
+
+    # ---- Levina-Bickel on selected layers (optional) ----
     lb_results = {}
     if not args.no_lb:
         lb_ks = [10, 30, 100]
         lb_idx = rng.choice(n_used, min(args.lb_points, n_used), replace=False)
         print(f"\nLevina-Bickel on {len(lb_idx)} points:")
 
-        # Raw input
-        X_lb = X[lb_idx].astype(np.float32)
-        lb_raw = {}
-        for k in lb_ks:
-            m, _ = levina_bickel_estimator(X_lb, k)
-            lb_raw[k] = m
-        lb_results['input'] = lb_raw
-        lb_str = '  '.join(f'k={k}: {lb_raw[k]:.2f}' for k in lb_ks)
-        print(f"  Input (20D):   {lb_str}")
-
-        # Each layer + output
-        for layer_i in range(n_all):
-            rep_lb = layer_reps[layer_i][lb_idx]
+        for key in selected_keys:
+            rep_lb = get_lb_data(key)
             lb_layer = {}
             for k in lb_ks:
                 m, _ = levina_bickel_estimator(rep_lb, k)
                 lb_layer[k] = m
-            key = f'layer_{layer_i+1}' if layer_i < n_encoder_layers else 'output'
             lb_results[key] = lb_layer
             lb_str = '  '.join(f'k={k}: {lb_layer[k]:.2f}' for k in lb_ks)
-            label = (f'Layer {layer_i+1}' if layer_i < n_encoder_layers
-                     else 'Output')
+            label = key.replace('_', ' ').title()
             print(f"  {label} ({rep_lb.shape[1]}D):  {lb_str}")
 
-    # ---- UMAP for raw input + each layer + output ----
-    n_panels = n_all + 1  # raw input + encoder layers + output projection
+    # ---- UMAP for selected layers ----
+    panels = [get_panel_data(key) for key in selected_keys]
+    n_panels = len(panels)
     n_cols = min(n_panels, 3)
     n_rows = (n_panels + n_cols - 1) // n_cols
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 6 * n_rows))
     if n_panels == 1:
         axes = np.array([axes])
-    axes = axes.flatten()
-
-    panels = [('Input (20D)', X[idx].astype(np.float32), 'input')]
-    for i in range(n_encoder_layers):
-        panels.append((f'Layer {i+1} ({layer_reps[i].shape[1]}D)',
-                        layer_reps[i][idx], f'layer_{i+1}'))
-    panels.append((f'Output ({layer_reps[-1].shape[1]}D)',
-                    layer_reps[-1][idx], 'output'))
+    axes = np.atleast_1d(axes).flatten()
 
     for ax_i, (title, data, lb_key) in enumerate(panels):
         print(f"Computing UMAP for {title}...")
@@ -236,6 +284,7 @@ def main():
     for ax_i in range(len(panels), len(axes)):
         axes[ax_i].axis('off')
 
+    layer_desc = '_'.join(selected_keys)
     fig.suptitle('UMAP of Intermediate Representations', fontsize=15,
                  fontweight='bold', y=1.02)
     plt.tight_layout()

@@ -40,9 +40,16 @@ class SyntheticSongDataset(Dataset):
     mask_ratio : float
         Fraction of time steps to mask per window (0.0–1.0).
     mask_patch_size : int
-        Contiguous patch size for each masked region.  Masking is done
-        in patches (not individual steps) to make the prediction task
-        harder and more realistic.
+        Contiguous patch size for each masked region (used when
+        mask_patch_min/max are not set).
+    mask_patch_min : int or None
+        Minimum patch size for variable-size masking.  If None,
+        defaults to mask_patch_size (fixed-size patches).
+    mask_patch_max : int or None
+        Maximum patch size for variable-size masking.  If None,
+        defaults to mask_patch_size (fixed-size patches).
+        Set both min and max for stochastic patch sizes, e.g.
+        mask_patch_min=8, mask_patch_max=64.
     mask_seed : int or None
         If set, masking is deterministic for reproducibility.
         If None, masking is random each time ``__getitem__`` is called.
@@ -55,6 +62,8 @@ class SyntheticSongDataset(Dataset):
         stride=None,
         mask_ratio=0.15,
         mask_patch_size=16,
+        mask_patch_min=None,
+        mask_patch_max=None,
         mask_seed=None,
     ):
         data_dir = Path(data_dir)
@@ -74,6 +83,9 @@ class SyntheticSongDataset(Dataset):
         self.stride = stride if stride is not None else seq_len
         self.mask_ratio = mask_ratio
         self.mask_patch_size = mask_patch_size
+        # Variable patch sizes: defaults to fixed size if min/max not given
+        self.mask_patch_min = mask_patch_min if mask_patch_min is not None else mask_patch_size
+        self.mask_patch_max = mask_patch_max if mask_patch_max is not None else mask_patch_size
         self.mask_seed = mask_seed
 
         # Pre-compute window start indices
@@ -88,6 +100,10 @@ class SyntheticSongDataset(Dataset):
         """
         Generate a patch-based mask for one window.
 
+        Each patch has a stochastic size drawn uniformly from
+        [mask_patch_min, mask_patch_max].  Patches are placed until
+        the target mask_ratio is approximately reached.
+
         Returns a boolean array of shape (seq_len,) where True means
         "this time step is masked and should be predicted."
         """
@@ -97,22 +113,28 @@ class SyntheticSongDataset(Dataset):
             rng = np.random.default_rng()
 
         mask = np.zeros(self.seq_len, dtype=bool)
-        n_patches = max(1, int(
-            self.mask_ratio * self.seq_len / self.mask_patch_size
-        ))
+        target_masked = int(self.mask_ratio * self.seq_len)
 
-        # Pick random patch start positions (without replacement if possible)
-        max_start = self.seq_len - self.mask_patch_size
-        if max_start <= 0:
-            mask[:] = True
-            return mask
+        # Use variable-size patches if min/max range is set
+        p_min = self.mask_patch_min
+        p_max = self.mask_patch_max
 
-        n_possible = max_start + 1
-        n_patches = min(n_patches, n_possible)
-        patch_starts = rng.choice(n_possible, size=n_patches, replace=False)
+        total_masked = 0
+        attempts = 0
+        max_attempts = self.seq_len  # safety limit
 
-        for s in patch_starts:
-            mask[s : s + self.mask_patch_size] = True
+        while total_masked < target_masked and attempts < max_attempts:
+            patch_size = rng.integers(p_min, p_max + 1)  # inclusive
+            max_start = self.seq_len - patch_size
+            if max_start <= 0:
+                mask[:] = True
+                return mask
+
+            s = rng.integers(0, max_start + 1)
+            new_masked = (~mask[s : s + patch_size]).sum()
+            mask[s : s + patch_size] = True
+            total_masked += new_masked
+            attempts += 1
 
         return mask
 

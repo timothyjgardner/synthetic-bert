@@ -1,5 +1,5 @@
 {
-  "n_steps": 100000,
+  "n_steps": 200000,
   "n_circles": 10,
   "ambient_dim": 20,
   "radius_mean": 20.0,
@@ -9,6 +9,6 @@
   "dwell_std": 100,
   "min_period": 40,
   "max_period": 400,
-  "subspace_dim": 4,
+  "subspace_dim": null,
   "seed": 42
 }

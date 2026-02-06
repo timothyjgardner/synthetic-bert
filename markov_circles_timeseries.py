@@ -641,7 +641,12 @@ if __name__ == '__main__':
                              'planes are drawn.  Controls geometric overlap: '
                              '20 (default) = no overlap, 4 = significant, '
                              '2 = maximum.  Range: 2..ambient_dim.')
+    parser.add_argument('--n-steps', type=int, default=None,
+                        help='Total time steps to generate '
+                             '(default: 100000)')
     args = parser.parse_args()
     if args.subspace_dim is not None:
         DEFAULT_CONFIG['subspace_dim'] = args.subspace_dim
+    if args.n_steps is not None:
+        DEFAULT_CONFIG['n_steps'] = args.n_steps
     main(run_umap=not args.no_umap)

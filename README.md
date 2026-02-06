@@ -110,6 +110,8 @@ After training, we extract the intermediate representations from each transforme
 
 ```bash
 python evaluate_representations.py --checkpoint bert_model.pt
+python evaluate_representations.py --checkpoint bert_model.pt --layers 7          # single layer
+python evaluate_representations.py --checkpoint bert_model.pt --layers input,4,output  # specific layers
 ```
 
 ![Representation UMAP](representation_umap.png)
@@ -123,6 +125,37 @@ python evaluate_representations.py --checkpoint bert_model.pt
 **Output (20D):** The final output projection head maps the 128D internal representation back to the original 20D feature space. This is the denoised reconstruction — the same signal used to compute MSE loss against the ground truth during training. Comparing this panel to the Input panel shows the model has learned to clean up noise and sharpen circle structure.
 
 The progression from Input → Layer 4 → Output shows the transformer learning to untangle the overlapping circles into a cleaner geometric structure, then projecting back to the original space, despite never being given explicit circle labels during training.
+
+### 7-Layer model with extended context (1024-step windows)
+
+A larger model (7 transformer layers, 1.47M parameters) trained on 200,000 time steps with 1024-step windows, stochastic mask patches (8–128 steps), stride 64, and BF16 mixed precision on an RTX 5090.
+
+**Data:** 200k steps, 10 circles in full 20D ambient space (subspace_dim=20, no geometric overlap), noise_std=2.83 (SNR ≈ 2.5).
+
+**Training:** 500 epochs, batch size 128, AdamW with linear warmup + cosine decay. Best val MSE: **8.06** (noise floor ≈ 8.0).
+
+```bash
+python masked_model_gpu.py --epochs 500 --n-layers 7 --stride 64 \
+    --mask-patch-min 8 --mask-patch-max 128 --seq-len 1024 --no-train-eval
+```
+
+![7-Layer Representation UMAP](representation_umap_7layer_1024.png)
+
+The Levina-Bickel intrinsic dimension shows a progressive compression through the network:
+
+| Layer | k=10 | k=30 | k=100 |
+|---|---|---|---|
+| Input (20D) | 11.7 | 8.0 | 6.7 |
+| Layer 1 | 14.8 | 12.4 | 10.6 |
+| Layer 2 | 10.3 | 10.7 | 10.5 |
+| Layer 3 | 9.6 | 9.6 | 7.7 |
+| Layer 4 | 8.4 | 8.7 | 6.9 |
+| Layer 5 | 6.3 | 7.2 | 7.9 |
+| Layer 6 | 5.5 | 4.4 | 3.9 |
+| Layer 7 | 5.4 | 2.6 | 1.6 |
+| Output (20D) | 1.5 | 1.2 | 1.6 |
+
+**Layer 1** initially *expands* dimensionality (projecting into 128D to separate circles), then **Layers 2–5** gradually compress, **Layers 6–7** make the major squeeze to ~2–3D, and the **Output** projection collapses to an intrinsic dimension of ~1.2 — close to the true 1D structure of each circle. The extended 1024-step context window gives the model enough information to nearly resolve the underlying circular manifold.
 
 ## Scripts
 
