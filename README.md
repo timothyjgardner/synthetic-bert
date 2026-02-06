@@ -157,6 +157,40 @@ The Levina-Bickel intrinsic dimension shows a progressive compression through th
 
 **Layer 1** initially *expands* dimensionality (projecting into 128D to separate circles), then **Layers 2–5** gradually compress, **Layers 6–7** make the major squeeze to ~2–3D, and the **Output** projection collapses to an intrinsic dimension of ~1.2 — close to the true 1D structure of each circle. The extended 1024-step context window gives the model enough information to nearly resolve the underlying circular manifold.
 
+### 7-Layer model with overlapping circles (subspace_dim=4)
+
+The same model architecture and training configuration as above, but with the 10 circle planes constrained to a **4-dimensional subspace** of the 20D ambient space. This forces significant geometric overlap between trajectories — circles can no longer be separated by the plane they occupy, so the model must rely on temporal dynamics (angular velocity, Markov transitions) to distinguish them.
+
+**Data:** 200k steps, 10 circles in a **4D subspace** of 20D ambient space (subspace_dim=4), noise_std=2.83 (SNR ≈ 2.5).
+
+**Training:** 7 transformer layers, 1.47M parameters, 1024-step windows, stochastic mask patches (8–128 steps), stride 64, BF16 mixed precision. Best val MSE: **8.10** (noise floor ≈ 8.0).
+
+```bash
+python markov_circles_timeseries.py --no-umap --n-steps 200000 --subspace-dim 4
+python masked_model_gpu.py --epochs 500 --n-layers 7 --stride 64 \
+    --mask-patch-min 8 --mask-patch-max 128 --seq-len 1024 --no-train-eval
+```
+
+![7-Layer Representation UMAP (subspace_dim=4)](representation_umap_7layer_1024_sub4.png)
+
+| Layer | k=10 | k=30 | k=100 |
+|---|---|---|---|
+| Input (20D) | 14.1 | 11.4 | 8.9 |
+| Layer 1 | 12.4 | 12.3 | 12.5 |
+| Layer 2 | 8.2 | 6.7 | 6.7 |
+| Layer 3 | 7.2 | 6.0 | 5.5 |
+| Layer 4 | 7.5 | 7.0 | 5.1 |
+| Layer 5 | 6.8 | 7.4 | 6.7 |
+| Layer 6 | 5.0 | 4.8 | 5.2 |
+| Layer 7 | 5.4 | 2.8 | 2.5 |
+| Output (20D) | 1.6 | 1.6 | 2.1 |
+
+Despite the heavy geometric overlap, the model reaches nearly the same val MSE (8.10 vs 8.06 for non-overlapping data). The key differences in the learned representations:
+
+- **Layers 2–3** compress more aggressively (LB k=30: 6–7 vs 10–11) — the model quickly discovers the signal lives in a low-dimensional subspace.
+- **Layer 7** and **Output** retain slightly higher dimensionality (2.8 and 1.6 vs 2.6 and 1.2 at k=30) — the model needs more structure to disambiguate overlapping circles than when they occupy orthogonal planes.
+- The model successfully uses **temporal context** (angular velocity differences, transition patterns) to separate circles that are geometrically inseparable in any single time step.
+
 ## Scripts
 
 | Script | Description |
@@ -164,6 +198,7 @@ The Levina-Bickel intrinsic dimension shows a progressive compression through th
 | `markov_circles_timeseries.py` | Generate the synthetic time series dataset |
 | `dataset.py` | PyTorch Dataset with sliding windows and patch masking |
 | `masked_model.py` | BERT-style masked prediction model (train & eval) |
+| `masked_model_gpu.py` | GPU-optimised version (BF16, torch.compile, RTX 5090) |
 | `evaluate_representations.py` | Extract and visualise intermediate representations |
 | `estimate_dimension.py` | Levina-Bickel intrinsic dimension estimation |
 | `levina_bickel_demo.py` | Single-circle dimension estimation demo |

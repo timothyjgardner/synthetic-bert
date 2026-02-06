@@ -9,6 +9,6 @@
   "dwell_std": 100,
   "min_period": 40,
   "max_period": 400,
-  "subspace_dim": null,
+  "subspace_dim": 4,
   "seed": 42
 }
