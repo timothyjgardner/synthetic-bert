@@ -72,8 +72,8 @@ def extract_representations(model, X, device, batch_size=64, seq_len=512):
           f"= {n_used} / {n_steps} time steps")
 
     # Process in batches
-    n_layers = len(model.transformer.layers)
-    all_layers = [[] for _ in range(n_layers)]
+    # encode() returns n_encoder_layers + 1 (output projection)
+    all_layers = None
 
     for start in range(0, n_windows, batch_size):
         end = min(start + batch_size, n_windows)
@@ -88,8 +88,11 @@ def extract_representations(model, X, device, batch_size=64, seq_len=512):
 
         layer_outputs = model.encode(x_batch)
 
+        if all_layers is None:
+            all_layers = [[] for _ in range(len(layer_outputs))]
+
         for i, lo in enumerate(layer_outputs):
-            # lo: (batch, seq_len, d_model) → flatten to (batch*seq_len, d_model)
+            # lo: (batch, seq_len, dim) → flatten to (batch*seq_len, dim)
             all_layers[i].append(lo.cpu().numpy().reshape(-1, lo.shape[-1]))
 
     layer_reps = [np.concatenate(chunks, axis=0) for chunks in all_layers]
@@ -138,10 +141,14 @@ def main():
         model, X, device, batch_size=64, seq_len=seq_len,
     )
     states_used = states[:n_used]
-    n_layers = len(layer_reps)
+    # Last entry is the output projection (feature_dim D), rest are encoder
+    # layers (d_model D)
+    n_encoder_layers = len(layer_reps) - 1
+    n_all = len(layer_reps)
 
-    print(f"Extracted {n_layers} layer representations, "
-          f"each {layer_reps[0].shape}")
+    print(f"Extracted {n_encoder_layers} encoder layers + output projection")
+    print(f"  Encoder layers: {layer_reps[0].shape}")
+    print(f"  Output projection: {layer_reps[-1].shape}")
 
     # ---- Subsample for UMAP ----
     rng = np.random.default_rng(42)
@@ -170,19 +177,22 @@ def main():
         lb_str = '  '.join(f'k={k}: {lb_raw[k]:.2f}' for k in lb_ks)
         print(f"  Input (20D):   {lb_str}")
 
-        # Each layer
-        for layer_i in range(n_layers):
+        # Each layer + output
+        for layer_i in range(n_all):
             rep_lb = layer_reps[layer_i][lb_idx]
             lb_layer = {}
             for k in lb_ks:
                 m, _ = levina_bickel_estimator(rep_lb, k)
                 lb_layer[k] = m
-            lb_results[f'layer_{layer_i+1}'] = lb_layer
+            key = f'layer_{layer_i+1}' if layer_i < n_encoder_layers else 'output'
+            lb_results[key] = lb_layer
             lb_str = '  '.join(f'k={k}: {lb_layer[k]:.2f}' for k in lb_ks)
-            print(f"  Layer {layer_i+1} ({rep_lb.shape[1]}D):  {lb_str}")
+            label = (f'Layer {layer_i+1}' if layer_i < n_encoder_layers
+                     else 'Output')
+            print(f"  {label} ({rep_lb.shape[1]}D):  {lb_str}")
 
-    # ---- UMAP for each layer + raw input ----
-    n_panels = n_layers + 1  # raw input + each layer
+    # ---- UMAP for raw input + each layer + output ----
+    n_panels = n_all + 1  # raw input + encoder layers + output projection
     n_cols = min(n_panels, 3)
     n_rows = (n_panels + n_cols - 1) // n_cols
 
@@ -191,12 +201,14 @@ def main():
         axes = np.array([axes])
     axes = axes.flatten()
 
-    panels = [('Input (20D)', X[idx].astype(np.float32))]
-    for i in range(n_layers):
+    panels = [('Input (20D)', X[idx].astype(np.float32), 'input')]
+    for i in range(n_encoder_layers):
         panels.append((f'Layer {i+1} ({layer_reps[i].shape[1]}D)',
-                        layer_reps[i][idx]))
+                        layer_reps[i][idx], f'layer_{i+1}'))
+    panels.append((f'Output ({layer_reps[-1].shape[1]}D)',
+                    layer_reps[-1][idx], 'output'))
 
-    for ax_i, (title, data) in enumerate(panels):
+    for ax_i, (title, data, lb_key) in enumerate(panels):
         print(f"Computing UMAP for {title}...")
         reducer = umap.UMAP(n_neighbors=args.umap_neighbors, min_dist=0.3,
                             metric='euclidean', random_state=42)
@@ -209,9 +221,8 @@ def main():
         ax.set_ylabel('UMAP 2')
 
         # Add LB info to title if available
-        key = 'input' if ax_i == 0 else f'layer_{ax_i}'
-        if key in lb_results:
-            lb30 = lb_results[key].get(30, None)
+        if lb_key in lb_results:
+            lb30 = lb_results[lb_key].get(30, None)
             if lb30 is not None:
                 title += f'  (LB k=30: {lb30:.1f})'
         ax.set_title(title, fontsize=12)

@@ -161,7 +161,8 @@ class MaskedTimeSeriesBERT(nn.Module):
     def encode(self, x):
         """
         Run input through the model *without masking* and return the
-        intermediate representation at every transformer layer.
+        intermediate representation at every transformer layer, plus
+        the final output projection (denoised reconstruction).
 
         Parameters
         ----------
@@ -169,10 +170,11 @@ class MaskedTimeSeriesBERT(nn.Module):
 
         Returns
         -------
-        layer_outputs : list of (batch, seq_len, d_model)
-            One tensor per transformer layer (len = n_layers).
-            layer_outputs[0] is after the first encoder layer,
-            layer_outputs[-1] is the final encoder output.
+        layer_outputs : list of tensors
+            - layer_outputs[0..n_layers-1]: (batch, seq_len, d_model)
+              after each transformer encoder layer.
+            - layer_outputs[n_layers]: (batch, seq_len, feature_dim)
+              after the output projection head (the reconstruction).
         """
         h = self.input_proj(x)
         h = self.pos_enc(h)
@@ -181,6 +183,9 @@ class MaskedTimeSeriesBERT(nn.Module):
         for layer in self.transformer.layers:
             h = layer(h)
             layer_outputs.append(h)
+
+        # Output projection (denoised reconstruction)
+        layer_outputs.append(self.output_proj(h))
 
         return layer_outputs
 

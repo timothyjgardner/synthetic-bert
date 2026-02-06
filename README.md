@@ -120,7 +120,9 @@ python evaluate_representations.py --checkpoint bert_model.pt
 
 **Layer 3–4:** The deeper layers learn increasingly structured representations. The model discovers a lower-dimensional organisation of the 10 circles, clustering points by their circle identity and phase — exactly the information needed to predict masked patches.
 
-The progression from input to layer 4 shows the transformer learning to untangle the overlapping circles into a cleaner geometric structure, despite never being given explicit circle labels during training.
+**Output (20D):** The final output projection head maps the 128D internal representation back to the original 20D feature space. This is the denoised reconstruction — the same signal used to compute MSE loss against the ground truth during training. Comparing this panel to the Input panel shows the model has learned to clean up noise and sharpen circle structure.
+
+The progression from Input → Layer 4 → Output shows the transformer learning to untangle the overlapping circles into a cleaner geometric structure, then projecting back to the original space, despite never being given explicit circle labels during training.
 
 ## Scripts
 
