@@ -123,9 +123,9 @@ python evaluate_representations.py --checkpoint bert_model.pt --layers 7        
 python evaluate_representations.py --checkpoint bert_model.pt --layers input,4,output # specific layers
 ```
 
-### 7-Layer model — no overlap (subspace_dim=20)
+### 7-Layer model with sinusoidal PE — no overlap (subspace_dim=20)
 
-7 transformer layers (1.47M parameters) trained on 200,000 time steps with 1024-step windows, stochastic mask patches (8–128 steps), stride 64, and BF16 mixed precision.
+7 transformer layers (1.47M parameters) with **sinusoidal positional encoding**, trained on 200,000 time steps with 1024-step windows, stochastic mask patches (8–128 steps), stride 64, and BF16 mixed precision.
 
 **Data:** 200k steps, 10 circles in full 20D ambient space (subspace_dim=20, no geometric overlap), noise_std=2.83 (SNR ≈ 2.5).
 
@@ -154,9 +154,9 @@ The Levina-Bickel intrinsic dimension shows a progressive compression through th
 
 **Layer 1** initially *expands* dimensionality (projecting into 128D to separate circles), then **Layers 2–5** gradually compress, **Layers 6–7** make the major squeeze to ~2–3D, and the **Output** projection collapses to an intrinsic dimension of ~1.2 — close to the true 1D structure of each circle. The extended 1024-step context window gives the model enough information to nearly resolve the underlying circular manifold.
 
-### 7-Layer model with overlapping circles (subspace_dim=4)
+### 7-Layer model with sinusoidal PE — overlapping circles (subspace_dim=4)
 
-The same model architecture and training configuration as above, but with the 10 circle planes constrained to a **4-dimensional subspace** of the 20D ambient space. This forces significant geometric overlap between trajectories — circles can no longer be separated by the plane they occupy, so the model must rely on temporal dynamics (angular velocity, Markov transitions) to distinguish them.
+The same model architecture and training configuration as above (sinusoidal positional encoding), but with the 10 circle planes constrained to a **4-dimensional subspace** of the 20D ambient space. This forces significant geometric overlap between trajectories — circles can no longer be separated by the plane they occupy, so the model must rely on temporal dynamics (angular velocity, Markov transitions) to distinguish them.
 
 **Data:** 200k steps, 10 circles in a **4D subspace** of 20D ambient space (subspace_dim=4), noise_std=2.83 (SNR ≈ 2.5).
 
