@@ -124,6 +124,96 @@ class T5RelativePositionBias(nn.Module):
         return values.permute(2, 0, 1).contiguous()
 
 
+# ---------------------------------------------------------------------------
+# RoPE — Rotary Position Embedding  (Su et al. 2021)
+# ---------------------------------------------------------------------------
+
+class RotaryPositionalEncoding(nn.Module):
+    """Precompute and cache cos/sin rotation matrices for RoPE."""
+
+    def __init__(self, head_dim, max_len=2048, base=10000.0):
+        super().__init__()
+        assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer('inv_freq', inv_freq)
+        t = torch.arange(max_len, dtype=torch.float)
+        freqs = torch.outer(t, inv_freq)
+        self.register_buffer('cos_cached', freqs.cos())
+        self.register_buffer('sin_cached', freqs.sin())
+
+    def forward(self, seq_len):
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+
+def _apply_rotary_emb(x, cos, sin):
+    d_half = x.shape[-1] // 2
+    x1, x2 = x[..., :d_half], x[..., d_half:]
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    return torch.cat([x1 * cos - x2 * sin,
+                      x1 * sin + x2 * cos], dim=-1)
+
+
+class RoPEMultiheadAttention(nn.Module):
+    """Multi-head attention with Rotary Position Embedding."""
+
+    def __init__(self, d_model, n_heads, dropout=0.0, max_len=2048,
+                 rope_base=10000.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.rope = RotaryPositionalEncoding(
+            self.head_dim, max_len=max_len, base=rope_base)
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, x):
+        B, S, _ = x.shape
+        qkv = self.qkv_proj(x).reshape(B, S, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        cos, sin = self.rope(S)
+        q = _apply_rotary_emb(q, cos, sin)
+        k = _apply_rotary_emb(k, cos, sin)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+            scale=self.scale)
+        out = out.transpose(1, 2).reshape(B, S, self.d_model)
+        return self.out_proj(out)
+
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """Transformer encoder layer with RoPE attention (post-norm)."""
+
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1,
+                 max_len=2048, rope_base=10000.0):
+        super().__init__()
+        self.self_attn = RoPEMultiheadAttention(
+            d_model, n_heads, dropout=dropout,
+            max_len=max_len, rope_base=rope_base)
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.activation = nn.GELU()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout_ff = nn.Dropout(dropout)
+
+    def forward(self, src, src_mask=None, **kwargs):
+        src2 = self.self_attn(src)
+        src = self.norm1(src + self.dropout1(src2))
+        src2 = self.linear2(self.dropout_ff(self.activation(self.linear1(src))))
+        src = self.norm2(src + self.dropout2(src2))
+        return src
+
+
 class MaskedTimeSeriesBERT(nn.Module):
     """
     BERT-style masked prediction model for continuous time series.
@@ -144,6 +234,8 @@ class MaskedTimeSeriesBERT(nn.Module):
         Dropout rate.
     max_len : int
         Maximum sequence length.
+    pos_encoding : str
+        ``'sinusoidal'``, ``'t5'``, or ``'rope'``.
     """
 
     def __init__(
@@ -158,6 +250,7 @@ class MaskedTimeSeriesBERT(nn.Module):
         pos_encoding='sinusoidal',
         t5_num_buckets=32,
         t5_max_distance=128,
+        rope_base=10000.0,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -171,34 +264,39 @@ class MaskedTimeSeriesBERT(nn.Module):
         # Input projection
         self.input_proj = nn.Linear(feature_dim, d_model)
 
-        # Positional encoding
+        # Positional encoding & transformer encoder
         if pos_encoding == 'sinusoidal':
             self.pos_enc = SinusoidalPositionalEncoding(
                 d_model, max_len, dropout)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+                dropout=dropout, batch_first=True, activation='gelu')
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer, num_layers=n_layers)
+
         elif pos_encoding == 't5':
             self.input_dropout = nn.Dropout(p=dropout)
             self.rel_pos_bias = T5RelativePositionBias(
-                n_heads=n_heads,
-                num_buckets=t5_num_buckets,
-                max_distance=t5_max_distance,
-            )
+                n_heads=n_heads, num_buckets=t5_num_buckets,
+                max_distance=t5_max_distance)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+                dropout=dropout, batch_first=True, activation='gelu')
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer, num_layers=n_layers)
+
+        elif pos_encoding == 'rope':
+            self.input_dropout = nn.Dropout(p=dropout)
+            self.rope_layers = nn.ModuleList([
+                RoPETransformerEncoderLayer(
+                    d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+                    dropout=dropout, max_len=max_len, rope_base=rope_base,
+                ) for _ in range(n_layers)
+            ])
         else:
             raise ValueError(
                 f"Unknown pos_encoding '{pos_encoding}'. "
-                f"Choose from: sinusoidal, t5")
-
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_ff,
-            dropout=dropout,
-            batch_first=True,
-            activation='gelu',
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=n_layers
-        )
+                f"Choose from: sinusoidal, t5, rope")
 
         # Output projection back to feature space
         self.output_proj = nn.Sequential(
@@ -238,10 +336,14 @@ class MaskedTimeSeriesBERT(nn.Module):
         if self.pos_encoding == 'sinusoidal':
             h = self.pos_enc(h)
             h = self.transformer(h)
-        else:  # t5
+        elif self.pos_encoding == 't5':
             h = self.input_dropout(h)
             attn_mask = self._get_t5_attn_mask(h.size(0), h.size(1))
             h = self.transformer(h, mask=attn_mask)
+        else:  # rope
+            h = self.input_dropout(h)
+            for layer in self.rope_layers:
+                h = layer(h)
 
         # Project back to feature space
         pred = self.output_proj(h)
@@ -270,27 +372,35 @@ class MaskedTimeSeriesBERT(nn.Module):
 
         if self.pos_encoding == 'sinusoidal':
             h = self.pos_enc(h)
+            layers = self.transformer.layers
             attn_mask = None
-        else:  # t5
+        elif self.pos_encoding == 't5':
             h = self.input_dropout(h)
+            layers = self.transformer.layers
             attn_mask = self._get_t5_attn_mask(h.size(0), h.size(1))
+        else:  # rope
+            h = self.input_dropout(h)
+            layers = self.rope_layers
+            attn_mask = None
 
         # NOTE: PyTorch's TransformerEncoderLayer has an inference-mode
         # "fast path" that mishandles 3D additive attention masks on GPU,
         # producing NaN.  Temporarily switching to train() mode disables
         # this fast path while keeping identical results (dropout is
-        # already 0 at eval time).
+        # already 0 at eval time).  RoPE layers don't need this workaround.
         need_train_mode = (attn_mask is not None and not self.training)
         if need_train_mode:
-            self.transformer.train()
+            for layer in layers:
+                layer.train()
 
         layer_outputs = []
-        for layer in self.transformer.layers:
+        for layer in layers:
             h = layer(h, src_mask=attn_mask)
             layer_outputs.append(h)
 
         if need_train_mode:
-            self.transformer.eval()
+            for layer in layers:
+                layer.eval()
 
         # Output projection (denoised reconstruction)
         layer_outputs.append(self.output_proj(h))

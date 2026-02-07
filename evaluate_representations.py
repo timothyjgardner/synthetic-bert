@@ -46,6 +46,7 @@ def load_model(checkpoint_path, device):
         pos_encoding=pos_encoding,
         t5_num_buckets=args.get('t5_num_buckets', 32),
         t5_max_distance=args.get('t5_max_distance', 128),
+        rope_base=args.get('rope_base', 10000.0),
     ).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()

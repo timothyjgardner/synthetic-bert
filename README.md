@@ -230,6 +230,60 @@ With sinusoidal positional encoding, the loss curve shows a **plateau around epo
 
 Compared to the sinusoidal model, the T5 representations show **smooth, monotonic dimension reduction from Layer 1 onward** — there is no initial dimensionality expansion at Layer 1 (LB k=30: 7.4 for T5 vs 12.4 for sinusoidal). The model passes through a less entangled state in the early layers, consistent with the smoother training dynamics. By the final layers, both models converge to similar intrinsic dimensions (~2.5 at k=30), confirming that the T5 model finds an equally compact representation of the circular manifolds while taking a more direct path to get there.
 
+### 7-Layer model with RoPE (subspace_dim=20)
+
+Same architecture and data, but using **Rotary Position Embedding** (RoPE, Su et al. 2021). RoPE encodes relative position by rotating query and key vectors in attention — pairs of dimensions are rotated by angles proportional to position, so the dot product between Q and K naturally depends on their relative distance. This requires a custom transformer encoder layer with RoPE baked into the attention computation, using `scaled_dot_product_attention` for flash-attention compatibility.
+
+**Data:** 200k steps, 10 circles in full 20D ambient space (subspace_dim=20, no geometric overlap), noise_std=2.83 (SNR ≈ 2.5).
+
+**Training:** 7 transformer layers, 1.47M parameters, 1024-step windows, stochastic mask patches (8–128 steps), stride 64, BF16 mixed precision. Best val MSE: **7.996** (noise floor ≈ 8.0).
+
+```bash
+python masked_model_gpu.py --epochs 500 --n-layers 7 --stride 64 \
+    --mask-patch-min 8 --mask-patch-max 128 --seq-len 1024 --no-train-eval \
+    --pos-encoding rope
+```
+
+#### Training dynamics: RoPE converges fastest
+
+RoPE converges significantly faster than both sinusoidal and T5 positional encoding.
+
+| Sinusoidal | T5 relative bias | RoPE |
+|---|---|---|
+| ![Sinusoidal](training_loss1.png) | ![T5](training_loss_t5.png) | ![RoPE](training_loss_rope.png) |
+
+RoPE reaches the noise floor by approximately **epoch 50** — roughly twice as fast as T5 (~100 epochs) and far faster than sinusoidal (~200 epochs with a plateau). The loss curve is the smoothest of all three schemes, with no plateaus or step transitions. This is consistent with RoPE's inductive bias: by encoding relative position directly into the geometry of the attention computation (via rotations in Q/K space), the model can immediately attend based on relative distance without needing to learn this capability from scratch.
+
+| Metric | Sinusoidal | T5 | RoPE |
+|---|---|---|---|
+| Best val MSE | 8.06 | 8.03 | **7.996** |
+| Approx. epochs to noise floor | ~200 | ~100 | **~50** |
+| Plateau in training? | Yes (epochs 80–130) | No | No |
+
+#### Learned representations (RoPE)
+
+![7-Layer Representation UMAP — RoPE](representation_umap_7layer_1024_rope.png)
+
+| Layer | k=10 | k=30 | k=100 |
+|---|---|---|---|
+| Input (20D) | 14.1 | 11.4 | 8.9 |
+| Layer 1 | 12.5 | 9.0 | 6.4 |
+| Layer 2 | 9.4 | 6.5 | 5.1 |
+| Layer 3 | 7.2 | 4.5 | 4.2 |
+| Layer 4 | 6.5 | 3.6 | 3.3 |
+| Layer 5 | 5.7 | 2.9 | 2.6 |
+| Layer 6 | 4.6 | 2.3 | 2.2 |
+| Layer 7 | 3.8 | 1.9 | 2.4 |
+| Output (20D) | 1.5 | 1.6 | 2.1 |
+
+RoPE produces the **most aggressive and monotonic dimension compression** of all three schemes. Key comparisons at k=30:
+
+- **Layer 1**: 9.0 (RoPE) vs 12.4 (sinusoidal) vs 7.4 (T5) — no dimensionality expansion
+- **Layer 4**: 3.6 (RoPE) vs 8.7 (sinusoidal) vs 5.4 (T5) — circles already well-separated
+- **Layer 7**: 1.9 (RoPE) vs 2.6 (sinusoidal) vs 2.5 (T5) — tightest final compression
+
+The circles separate cleanly by Layers 3–4 (2–3 layers earlier than sinusoidal), and the final intrinsic dimension of 1.9 is the closest to the true 1D structure of each circular manifold. RoPE's rotational encoding appears to be a natural match for this data — the underlying signal is literally circular motion, and RoPE's position-dependent rotations in embedding space may provide a particularly efficient basis for representing periodic temporal structure.
+
 ## Scripts
 
 | Script | Description |
