@@ -63,34 +63,31 @@ With 10 circle planes crammed into a 4D subspace, UMAP can no longer fully separ
 
 ## BERT Masked Prediction Model
 
-A transformer encoder is trained to predict masked patches of the time series from surrounding context. This is a continuous analogue of BERT — instead of masking discrete tokens, we mask contiguous 16-step patches of the 20D signal and train the model to reconstruct them.
+A transformer encoder is trained to predict masked patches of the time series from surrounding context. This is a continuous analogue of BERT — instead of masking discrete tokens, we mask contiguous patches of the 20D signal and train the model to reconstruct them.
 
 ### Architecture
 
 ```
-Input (batch, 512, 20)
+Input (batch, seq_len, 20)
   → replace masked positions with learnable [MASK] embedding
   → Linear(20 → 128)
   → sinusoidal positional encoding
-  → 4 × TransformerEncoderLayer (4 heads, 512-dim FFN, GELU)
+  → N × TransformerEncoderLayer (4 heads, 512-dim FFN, GELU)
   → Linear(128 → 512 → 20)
   → MSE loss on masked positions only
 ```
 
-872K parameters. 15% of time steps masked per window in contiguous patches of 16.
+15% of time steps masked per window. Mask patch sizes can be fixed or stochastic (e.g. 8–128 steps).
 
 ### Training
 
 ```bash
-python masked_model.py --epochs 500          # train
-python masked_model.py --eval bert_model.pt  # evaluate & visualize
+python masked_model.py --epochs 500                    # baseline (4 layers, 512 window)
+python masked_model_gpu.py --epochs 500 --n-layers 7 \ # GPU-optimised (7 layers, 1024 window)
+    --seq-len 1024 --stride 64 --mask-patch-min 8 --mask-patch-max 128
 ```
 
-The model uses AdamW with linear warmup (20 epochs) followed by cosine decay, trained on sliding windows with stride 128.
-
-![Training loss](training_loss.png)
-
-The training loss drops from ~27 (baseline: predicting zero) to ~8.8, which is close to the **noise floor of ~8.0** (noise_std² = 2.83² ≈ 8). This means the model has learned to reconstruct the noiseless circular signal nearly perfectly — the remaining error is irreducible observation noise.
+The model uses AdamW with linear warmup (20 epochs) followed by cosine decay. The GPU-optimised version (`masked_model_gpu.py`) adds BF16 mixed precision, `torch.compile`, and multi-worker data loading.
 
 ### Masked predictions
 
@@ -106,29 +103,17 @@ Each figure shows four rows: (1) state labels with masked regions in grey, (2) g
 
 ## Learned Representations
 
-After training, we extract the intermediate representations from each transformer layer by running the full dataset through the model without masking. UMAP reveals how the model organises the data internally.
+After training, we extract the intermediate representations from each transformer layer by running the full dataset through the model without masking. UMAP reveals how the model organises the data internally, and Levina-Bickel intrinsic dimension estimates quantify the compression at each layer.
 
 ```bash
-python evaluate_representations.py --checkpoint bert_model.pt
-python evaluate_representations.py --checkpoint bert_model.pt --layers 7          # single layer
-python evaluate_representations.py --checkpoint bert_model.pt --layers input,4,output  # specific layers
+python evaluate_representations.py --checkpoint bert_model.pt                        # all layers
+python evaluate_representations.py --checkpoint bert_model.pt --layers 7             # single layer
+python evaluate_representations.py --checkpoint bert_model.pt --layers input,4,output # specific layers
 ```
 
-![Representation UMAP](representation_umap.png)
+### 7-Layer model — no overlap (subspace_dim=20)
 
-**Input (20D):** The raw data — circles overlap due to subspace_dim=4 and noise.
-
-**Layer 1–2:** The early transformer layers begin to separate circles and denoise the signal.
-
-**Layer 3–4:** The deeper layers learn increasingly structured representations. The model discovers a lower-dimensional organisation of the 10 circles, clustering points by their circle identity and phase — exactly the information needed to predict masked patches.
-
-**Output (20D):** The final output projection head maps the 128D internal representation back to the original 20D feature space. This is the denoised reconstruction — the same signal used to compute MSE loss against the ground truth during training. Comparing this panel to the Input panel shows the model has learned to clean up noise and sharpen circle structure.
-
-The progression from Input → Layer 4 → Output shows the transformer learning to untangle the overlapping circles into a cleaner geometric structure, then projecting back to the original space, despite never being given explicit circle labels during training.
-
-### 7-Layer model with extended context (1024-step windows)
-
-A larger model (7 transformer layers, 1.47M parameters) trained on 200,000 time steps with 1024-step windows, stochastic mask patches (8–128 steps), stride 64, and BF16 mixed precision on an RTX 5090.
+7 transformer layers (1.47M parameters) trained on 200,000 time steps with 1024-step windows, stochastic mask patches (8–128 steps), stride 64, and BF16 mixed precision.
 
 **Data:** 200k steps, 10 circles in full 20D ambient space (subspace_dim=20, no geometric overlap), noise_std=2.83 (SNR ≈ 2.5).
 
