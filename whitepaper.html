@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Positional Encoding and Representation Geometry in Masked Time Series Transformers</title>
+<script>
+MathJax = {
+  tex: { inlineMath: [['$','$'], ['\\(','\\)']], displayMath: [['$$','$$'], ['\\[','\\]']] },
+  svg: { fontCache: 'global' }
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" async></script>
+<style>
+  :root { --accent: #2c5282; --bg: #fff; --text: #1a202c; --muted: #718096; --border: #e2e8f0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Georgia', 'Times New Roman', serif; color: var(--text); background: var(--bg);
+         max-width: 52em; margin: 0 auto; padding: 2em 1.5em 4em; line-height: 1.65; font-size: 16px; }
+  h1 { font-size: 1.7em; text-align: center; margin: 1.5em 0 0.3em; color: var(--accent); }
+  .authors { text-align: center; font-size: 0.95em; color: var(--muted); margin-bottom: 0.2em; }
+  .date { text-align: center; font-size: 0.88em; color: var(--muted); margin-bottom: 2em; }
+  h2 { font-size: 1.25em; margin: 2em 0 0.6em; color: var(--accent); border-bottom: 2px solid var(--border); padding-bottom: 0.2em; }
+  h3 { font-size: 1.05em; margin: 1.5em 0 0.5em; color: #2d3748; }
+  p { margin: 0.6em 0; text-align: justify; }
+  img { max-width: 100%; height: auto; display: block; margin: 1em auto; border: 1px solid var(--border); border-radius: 4px; }
+  .fig-row { display: flex; gap: 0.8em; justify-content: center; flex-wrap: wrap; margin: 1em 0; }
+  .fig-row img { flex: 1 1 30%; max-width: 32%; border: 1px solid var(--border); border-radius: 4px; }
+  .fig-caption { text-align: center; font-size: 0.88em; color: var(--muted); margin: -0.5em 0 1.2em; font-style: italic; }
+  table { border-collapse: collapse; margin: 1em auto; font-size: 0.92em; }
+  th, td { border: 1px solid var(--border); padding: 0.35em 0.7em; text-align: center; }
+  th { background: #edf2f7; font-weight: 600; }
+  td:first-child { text-align: left; }
+  .abstract { background: #f7fafc; border-left: 4px solid var(--accent); padding: 1em 1.2em; margin: 1.5em 0; font-size: 0.95em; }
+  .abstract strong { display: block; margin-bottom: 0.3em; }
+  ol, ul { margin: 0.5em 0 0.5em 1.8em; }
+  li { margin: 0.25em 0; }
+  code { font-family: 'Menlo', 'Consolas', monospace; font-size: 0.88em; background: #edf2f7; padding: 0.1em 0.3em; border-radius: 3px; }
+  .ref-list { font-size: 0.9em; }
+  .ref-list p { text-indent: -1.5em; padding-left: 1.5em; margin: 0.3em 0; }
+  .two-col-fig { display: flex; gap: 1em; justify-content: center; margin: 1em 0; }
+  .two-col-fig img { max-width: 48%; }
+</style>
+</head>
+<body>
+
+<h1>Positional Encoding and Representation Geometry in Masked Time Series Transformers</h1>
+<p class="authors">Timothy J. Gardner</p>
+<p class="date">February 2026 &mdash; Draft</p>
+
+<div class="abstract">
+<strong>Abstract</strong>
+We study how positional encoding schemes shape the internal representations learned by BERT-style masked prediction transformers on continuous time series.
+Using a synthetic dataset of Markov-switching circular trajectories in high-dimensional space, we compare three positional encoding strategies&mdash;sinusoidal (absolute), T5-style learned relative bias, and Rotary Position Embedding (RoPE)&mdash;in terms of convergence speed, final reconstruction accuracy, and the intrinsic dimensionality of intermediate representations.
+We find that relative positional encodings (T5 and RoPE) converge substantially faster and produce smoother, more monotonic dimensionality compression across transformer layers.
+RoPE achieves the fastest convergence (reaching the noise floor in ~50 epochs vs ~200 for sinusoidal), the lowest validation loss, and the tightest final intrinsic dimension (1.9 vs 2.6 for sinusoidal at $k=30$).
+These results suggest that the choice of positional encoding has a significant effect not just on training dynamics, but on the geometric organisation of learned representations.
+</div>
+
+<h2>1. Introduction</h2>
+
+<p>
+Transformer architectures have become the dominant approach for sequence modelling, but their mechanisms for encoding positional information vary widely.
+The original transformer <a href="#ref-vaswani">[1]</a> used fixed sinusoidal encodings added to input embeddings.
+Subsequent work introduced relative position schemes: T5 <a href="#ref-raffel">[2]</a> uses learned additive biases on attention logits indexed by bucketed relative distance, while Rotary Position Embedding (RoPE) <a href="#ref-su">[3]</a> encodes relative position through rotations applied to query and key vectors.
+</p>
+
+<p>
+While these schemes have been extensively benchmarked on NLP tasks, less is known about how they affect the <em>geometry</em> of learned internal representations&mdash;particularly in continuous-valued time series settings where the signal has known low-dimensional manifold structure.
+This work uses a synthetic time series with precisely controlled geometric properties to study how positional encoding influences both training dynamics and the intrinsic dimensionality of representations at each transformer layer.
+</p>
+
+<h2>2. Synthetic Dataset</h2>
+
+<p>
+We construct a continuous time series that mimics syllable-structured sequential data (e.g. birdsong).
+A point traverses one of $C = 10$ circles embedded in $\mathbb{R}^{D}$ with $D = 20$, switching between circles according to a sparse Markov transition matrix with ring connectivity and long-range shortcuts.
+</p>
+
+<h3>2.1 Circle construction</h3>
+
+<p>
+Each circle $c \in \{1, \ldots, C\}$ is defined by a 2D plane $\text{span}(\mathbf{u}_c, \mathbf{v}_c)$ in $\mathbb{R}^D$, where $\mathbf{u}_c, \mathbf{v}_c$ are orthonormal vectors.
+The trajectory on circle $c$ at angle $\theta$ is:
+</p>
+
+$$\mathbf{x}_c(\theta) = r_c \left( \cos\theta \cdot \mathbf{u}_c + \sin\theta \cdot \mathbf{v}_c \right)$$
+
+<p>
+where $r_c$ is the radius.
+Each circle has a fixed angular velocity $\omega_c$, with periods ranging from 40 to 400 time steps (a 10&times; speed range).
+Dwell times on each circle average ~400 steps, quantised to whole revolutions so that entry and exit angles are consistent.
+</p>
+
+<h3>2.2 Geometric overlap control</h3>
+
+<p>
+The degree of geometric overlap between circles is controlled by constraining the 2D planes to a shared subspace of dimension $d_{\text{sub}} \leq D$.
+When $d_{\text{sub}} = D = 20$, each circle occupies a nearly orthogonal plane, producing minimal overlap.
+When $d_{\text{sub}} = 4$, ten 2D planes are forced into a 4D subspace, creating significant trajectory overlap&mdash;the model must rely on temporal dynamics rather than instantaneous geometry to distinguish circles.
+</p>
+
+<h3>2.3 Noise model</h3>
+
+<p>
+Isotropic Gaussian noise is added to every observation: $\mathbf{y}_t = \mathbf{x}_t + \boldsymbol{\epsilon}_t$ with $\boldsymbol{\epsilon}_t \sim \mathcal{N}(\mathbf{0}, \sigma^2 \mathbf{I}_D)$.
+We set $\sigma = 2.83$, yielding SNR $\approx 2.5$.
+The noise floor for masked MSE loss is $\sigma^2 = 8.0$.
+</p>
+
+<div class="two-col-fig">
+  <img src="sample_window_0.png" alt="Sample time series window">
+  <img src="umap_subspace_20.png" alt="UMAP of raw data">
+</div>
+<p class="fig-caption">Figure 1. Left: A sample window of the 20D time series (heatmap) with Markov state labels (top strip). Right: UMAP of the raw data with $d_{\text{sub}} = 20$ showing 10 well-separated circular manifolds.</p>
+
+<h2>3. Model Architecture</h2>
+
+<p>
+We train a BERT-style <a href="#ref-devlin">[4]</a> masked prediction model adapted for continuous time series.
+The architecture is:
+</p>
+
+$$\text{Input} \; (B, T, 20) \;\xrightarrow{\text{mask}}\; \text{Linear}(20 \to d) \;\xrightarrow{\text{PE}}\; N \times \text{TransformerEncoder} \;\xrightarrow{}\; \text{MLP}(d \to 20)$$
+
+<p>
+where $d = 128$, $N = 7$ layers, 4 attention heads, and FFN dimension 512 with GELU activation.
+Masked positions (15% of each window) are replaced with a learnable <code>[MASK]</code> embedding before projection.
+The loss is MSE computed only on masked positions:
+</p>
+
+$$\mathcal{L} = \frac{1}{|\mathcal{M}|} \sum_{t \in \mathcal{M}} \| \hat{\mathbf{y}}_t - \mathbf{y}_t \|^2$$
+
+<p>
+where $\mathcal{M}$ is the set of masked time indices.
+Masking uses stochastic contiguous patches with sizes drawn uniformly from $[8, 128]$ time steps.
+</p>
+
+<h3>3.1 Positional encoding schemes</h3>
+
+<p>We compare three positional encoding strategies:</p>
+
+<p><strong>Sinusoidal (absolute).</strong>
+Following Vaswani et al. <a href="#ref-vaswani">[1]</a>, fixed sinusoidal encodings are added to the input embeddings:
+</p>
+
+$$\text{PE}(t, 2i) = \sin\!\left(\frac{t}{10000^{2i/d}}\right), \quad \text{PE}(t, 2i+1) = \cos\!\left(\frac{t}{10000^{2i/d}}\right)$$
+
+<p><strong>T5 relative bias (learned).</strong>
+Following Raffel et al. <a href="#ref-raffel">[2]</a>, a learned per-head bias $b_h(i - j)$ is added to the attention logits before softmax.
+Relative distances are mapped to $B = 64$ buckets using a logarithmic scheme: exact buckets for small distances, log-spaced buckets for distances up to $d_{\max} = 1024$.
+No positional information is added to the input embeddings.
+</p>
+
+<p><strong>RoPE (rotary).</strong>
+Following Su et al. <a href="#ref-su">[3]</a>, queries and keys are rotated by position-dependent angles before the dot product.
+For head dimension $d_h$ and position $t$, the rotation frequencies are $\theta_i = 10000^{-2i/d_h}$.
+The rotation is applied to pairs of dimensions:
+</p>
+
+$$\text{RoPE}(\mathbf{q}, t)_{2i:2i+1} = \begin{pmatrix} \cos(t\theta_i) & -\sin(t\theta_i) \\ \sin(t\theta_i) & \cos(t\theta_i) \end{pmatrix} \begin{pmatrix} q_{2i} \\ q_{2i+1} \end{pmatrix}$$
+
+<p>
+This ensures that $\langle \text{RoPE}(\mathbf{q}, t), \text{RoPE}(\mathbf{k}, s) \rangle$ depends only on $t - s$, encoding relative position directly into the attention geometry.
+RoPE requires a custom attention module; we implement this using PyTorch's <code>scaled_dot_product_attention</code> for flash-attention compatibility.
+</p>
+
+<h2>4. Training Protocol</h2>
+
+<p>
+All models use identical hyperparameters: AdamW optimiser with peak learning rate $3 \times 10^{-4}$, weight decay 0.01, linear warmup for 20 epochs followed by cosine decay over 500 total epochs.
+Batch size is 128, sequence length is 1024 time steps with stride 64.
+Training uses BF16 mixed precision and <code>torch.compile</code> on an NVIDIA RTX 5090 GPU.
+The dataset consists of 200,000 time steps with a 90/10 train/validation split.
+</p>
+
+<h2>5. Representation Analysis Methods</h2>
+
+<p>
+After training, we extract intermediate representations from each transformer layer by running the full dataset through the model without masking.
+We analyse these representations using two complementary methods:
+</p>
+
+<p><strong>UMAP visualisation.</strong>
+We use Uniform Manifold Approximation and Projection <a href="#ref-mcinnes">[5]</a> to produce 2D embeddings of each layer's output, coloured by circle identity.
+This reveals qualitative structure: when circles separate into distinct clusters, the model has learned to disentangle the latent states.
+</p>
+
+<p><strong>Levina-Bickel intrinsic dimension estimation.</strong>
+We estimate the intrinsic dimensionality of each layer's representation using the maximum-likelihood estimator of Levina and Bickel <a href="#ref-levina">[6]</a>.
+For a point $\mathbf{x}$ and its $k$-th nearest neighbour at distance $R_k(\mathbf{x})$:
+</p>
+
+$$\hat{m}_k(\mathbf{x}) = \left[ \frac{1}{k-1} \sum_{j=1}^{k-1} \log \frac{R_k(\mathbf{x})}{R_j(\mathbf{x})} \right]^{-1}$$
+
+<p>
+The global estimate averages over all points.
+We report estimates at $k \in \{10, 30, 100\}$ to capture structure at different scales: small $k$ reflects local geometry while large $k$ captures global manifold structure.
+</p>
+
+<h2>6. Results</h2>
+
+<h3>6.1 Training dynamics</h3>
+
+<p>
+The three positional encoding schemes exhibit markedly different convergence behaviour, despite identical architectures and hyperparameters.
+</p>
+
+<div class="fig-row">
+  <img src="training_loss1.png" alt="Sinusoidal training loss">
+  <img src="training_loss_t5.png" alt="T5 training loss">
+  <img src="training_loss_rope.png" alt="RoPE training loss">
+</div>
+<p class="fig-caption">Figure 2. Training loss curves for sinusoidal (left), T5 relative bias (centre), and RoPE (right). All runs use identical architecture, data, and hyperparameters; only the positional encoding differs.</p>
+
+<table>
+<tr><th>Metric</th><th>Sinusoidal</th><th>T5</th><th>RoPE</th></tr>
+<tr><td>Best val MSE</td><td>8.06</td><td>8.03</td><td><strong>7.996</strong></td></tr>
+<tr><td>Epochs to noise floor</td><td>~200</td><td>~100</td><td><strong>~50</strong></td></tr>
+<tr><td>Training plateau</td><td>Yes (epochs 80&ndash;130)</td><td>No</td><td>No</td></tr>
+</table>
+<p class="fig-caption">Table 1. Comparison of training dynamics across positional encoding schemes.</p>
+
+<p>
+The sinusoidal model exhibits a plateau between epochs 80&ndash;130, suggesting the model passes through a more entangled intermediate representational state before finding a good solution.
+T5 eliminates this plateau, converging smoothly.
+RoPE converges roughly 4&times; faster than sinusoidal, reaching the noise floor by epoch ~50 with no plateaus or step transitions.
+</p>
+
+<h3>6.2 Intrinsic dimensionality across layers</h3>
+
+<p>
+We use the Levina-Bickel estimator at $k = 30$ to track how intrinsic dimensionality evolves through the network.
+The input data has an estimated dimension of 11.4.
+</p>
+
+<table>
+<tr><th>Layer</th><th>Sinusoidal</th><th>T5</th><th>RoPE</th></tr>
+<tr><td>Input (20D)</td><td>8.0</td><td>11.4</td><td>11.4</td></tr>
+<tr><td>Layer 1</td><td>12.4</td><td>7.4</td><td>9.0</td></tr>
+<tr><td>Layer 2</td><td>10.7</td><td>6.8</td><td>6.5</td></tr>
+<tr><td>Layer 3</td><td>9.6</td><td>6.1</td><td>4.5</td></tr>
+<tr><td>Layer 4</td><td>8.7</td><td>5.4</td><td>3.6</td></tr>
+<tr><td>Layer 5</td><td>7.2</td><td>4.7</td><td>2.9</td></tr>
+<tr><td>Layer 6</td><td>4.4</td><td>3.7</td><td>2.3</td></tr>
+<tr><td>Layer 7</td><td>2.6</td><td>2.5</td><td><strong>1.9</strong></td></tr>
+<tr><td>Output (20D)</td><td>1.2</td><td>1.6</td><td>1.6</td></tr>
+</table>
+<p class="fig-caption">Table 2. Levina-Bickel intrinsic dimension estimates ($k = 30$) at each layer for the three positional encoding schemes.</p>
+
+<p>
+The sinusoidal model shows a characteristic <em>expansion-then-compression</em> pattern: Layer 1 <em>increases</em> dimensionality from 8.0 to 12.4 (projecting the 20D input into a 128D space that initially entangles the representations), followed by gradual compression through Layers 2&ndash;7.
+The major dimensionality squeeze occurs in the final two layers.
+</p>
+
+<p>
+T5 eliminates the Layer 1 expansion entirely (7.4 vs 12.4), producing monotonic compression from the first layer onward.
+RoPE goes further: while Layer 1 is slightly higher than T5 (9.0 vs 7.4), it compresses more aggressively through the middle layers.
+By Layer 4, RoPE has already reached 3.6&mdash;a level that the sinusoidal model doesn't achieve until Layer 6.
+The final-layer dimension of 1.9 for RoPE is the closest of all three schemes to the true 1D structure of each circular manifold.
+</p>
+
+<h3>6.3 UMAP visualisation</h3>
+
+<img src="representation_umap_7layer_1024.png" alt="Sinusoidal UMAP" style="max-width: 95%;">
+<p class="fig-caption">Figure 3. UMAP of intermediate representations for the <strong>sinusoidal</strong> model. The circles become progressively separated through the layers, but Layer 1 shows a tangled, high-dimensional state.</p>
+
+<img src="representation_umap_7layer_1024_t5.png" alt="T5 UMAP" style="max-width: 95%;">
+<p class="fig-caption">Figure 4. UMAP of intermediate representations for the <strong>T5</strong> model. Circles begin separating earlier (Layer 2&ndash;3) with a smoother progression.</p>
+
+<img src="representation_umap_7layer_1024_rope.png" alt="RoPE UMAP" style="max-width: 95%;">
+<p class="fig-caption">Figure 5. UMAP of intermediate representations for the <strong>RoPE</strong> model. Circles are well-separated by Layer 3&ndash;4, roughly 2&ndash;3 layers earlier than sinusoidal, with the tightest final clustering.</p>
+
+<h3>6.4 Effect of geometric overlap</h3>
+
+<p>
+We also trained the sinusoidal model on data with $d_{\text{sub}} = 4$, where the 10 circle planes are constrained to a shared 4D subspace.
+Despite the heavy geometric overlap (circles cannot be separated by the plane they occupy in any single time step), the model achieves nearly the same validation MSE (8.10 vs 8.06), demonstrating that the transformer can extract temporal structure (angular velocity differences, Markov transition patterns) to distinguish overlapping manifolds.
+</p>
+
+<div class="two-col-fig">
+  <img src="representation_umap_7layer_1024.png" alt="UMAP no overlap" style="max-width: 48%;">
+  <img src="representation_umap_7layer_1024_sub4.png" alt="UMAP with overlap" style="max-width: 48%;">
+</div>
+<p class="fig-caption">Figure 6. Final UMAP panels for sinusoidal model trained on non-overlapping ($d_{\text{sub}} = 20$, left) and overlapping ($d_{\text{sub}} = 4$, right) circle configurations.</p>
+
+<h2>7. Discussion</h2>
+
+<p>
+Our results reveal a clear hierarchy among positional encoding schemes for this task, which we believe reflects fundamental differences in inductive bias:
+</p>
+
+<p>
+<strong>Sinusoidal encoding creates a representational bottleneck.</strong>
+By adding fixed absolute position signals to the input embeddings, the model must first disentangle position from content&mdash;leading to the observed dimensionality expansion at Layer 1 and the training plateau around epochs 80&ndash;130.
+The model effectively needs to "unlearn" absolute position before it can build useful relative representations.
+</p>
+
+<p>
+<strong>Relative encodings bypass this bottleneck.</strong>
+Both T5 and RoPE encode position through the attention mechanism itself (via additive bias or Q/K rotation, respectively), leaving the input embeddings free to represent content from the start.
+This produces monotonic dimensionality compression and eliminates the training plateau.
+</p>
+
+<p>
+<strong>RoPE's rotational structure may be especially well-suited to periodic data.</strong>
+The underlying signal consists of points traversing circles&mdash;fundamentally periodic, rotational dynamics.
+RoPE encodes position via rotations in the embedding space, which may provide a natural basis for representing such structure.
+This could explain why RoPE achieves both the fastest convergence and the tightest final compression ($\hat{m} = 1.9$ vs 2.5&ndash;2.6 for the other schemes).
+However, we note that this hypothesis requires further investigation with non-periodic datasets.
+</p>
+
+<p>
+<strong>Practical implications.</strong>
+For continuous time series modelling, our results suggest that relative positional encodings should be preferred over absolute sinusoidal encodings.
+RoPE in particular offers a compelling combination of fast convergence, high reconstruction accuracy, and compact learned representations, at the cost of requiring a custom attention implementation.
+T5 bias offers a simpler implementation path (using standard attention masks) with most of the benefits.
+</p>
+
+<h2>8. Conclusion</h2>
+
+<p>
+We have demonstrated that positional encoding has a substantial effect on both training dynamics and representation geometry in masked time series transformers.
+Using a synthetic dataset with known manifold structure, we showed that relative positional encodings (T5 bias and RoPE) produce smoother training, faster convergence, and more monotonic dimensionality compression compared to absolute sinusoidal encoding.
+RoPE achieves the best performance across all metrics, reaching the noise floor in approximately 50 epochs (4&times; faster than sinusoidal) while compressing representations to an intrinsic dimension of 1.9&mdash;close to the true 1D structure of the underlying circular manifolds.
+</p>
+
+<p>
+The Levina-Bickel intrinsic dimension estimator provides a quantitative lens on the layer-by-layer organisation of transformer representations, complementing qualitative UMAP visualisations.
+Our synthetic framework&mdash;with controllable dimensionality, geometric overlap, and noise level&mdash;may be useful for future studies of transformer representation learning.
+</p>
+
+<h2>References</h2>
+
+<div class="ref-list">
+<p id="ref-vaswani">[1] A. Vaswani, N. Shazeer, N. Parmar, et al., "Attention is all you need," <em>NeurIPS</em>, 2017.</p>
+<p id="ref-raffel">[2] C. Raffel, N. Shazeer, A. Roberts, et al., "Exploring the limits of transfer learning with a unified text-to-text transformer," <em>JMLR</em>, vol. 21, no. 140, pp. 1–67, 2020.</p>
+<p id="ref-su">[3] J. Su, Y. Lu, S. Pan, A. Murtadha, B. Wen, and Y. Liu, "RoFormer: Enhanced transformer with rotary position embedding," <em>Neurocomputing</em>, vol. 568, 2024.</p>
+<p id="ref-devlin">[4] J. Devlin, M.-W. Chang, K. Lee, and K. Toutanova, "BERT: Pre-training of deep bidirectional transformers for language understanding," <em>NAACL-HLT</em>, 2019.</p>
+<p id="ref-mcinnes">[5] L. McInnes, J. Healy, and J. Melville, "UMAP: Uniform manifold approximation and projection for dimension reduction," <em>arXiv:1802.03426</em>, 2018.</p>
+<p id="ref-levina">[6] E. Levina and P. J. Bickel, "Maximum likelihood estimation of intrinsic dimension," <em>NeurIPS</em>, 2004.</p>
+</div>
+
+</body>
+</html>
