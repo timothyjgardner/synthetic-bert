@@ -34,6 +34,7 @@ def load_model(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     args = ckpt['args']
 
+    pos_encoding = args.get('pos_encoding', 'sinusoidal')
     model = MaskedTimeSeriesBERT(
         feature_dim=args.get('feature_dim', 20),
         d_model=args['d_model'],
@@ -42,12 +43,16 @@ def load_model(checkpoint_path, device):
         d_ff=args['d_ff'],
         dropout=0.0,  # no dropout at eval time
         max_len=args['seq_len'] + 64,
+        pos_encoding=pos_encoding,
+        t5_num_buckets=args.get('t5_num_buckets', 32),
+        t5_max_distance=args.get('t5_max_distance', 128),
     ).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
 
     print(f"Loaded checkpoint from epoch {ckpt['epoch']}  "
-          f"(val MSE = {ckpt['val_loss']:.4f})")
+          f"(val MSE = {ckpt['val_loss']:.4f}, "
+          f"pos_encoding={pos_encoding})")
     return model, args
 
 

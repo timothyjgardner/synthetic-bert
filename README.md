@@ -71,7 +71,7 @@ A transformer encoder is trained to predict masked patches of the time series fr
 Input (batch, seq_len, 20)
   → replace masked positions with learnable [MASK] embedding
   → Linear(20 → 128)
-  → sinusoidal positional encoding
+  → positional encoding (sinusoidal or T5 relative bias)
   → N × TransformerEncoderLayer (4 heads, 512-dim FFN, GELU)
   → Linear(128 → 512 → 20)
   → MSE loss on masked positions only
@@ -79,12 +79,24 @@ Input (batch, seq_len, 20)
 
 15% of time steps masked per window. Mask patch sizes can be fixed or stochastic (e.g. 8–128 steps).
 
+Two positional encoding schemes are supported (selected via `--pos-encoding`):
+
+| Scheme | Type | Description |
+|---|---|---|
+| `sinusoidal` (default) | Absolute, fixed | Standard Vaswani et al. (2017) sinusoidal encoding added to input embeddings |
+| `t5` | Relative, learned | T5-style relative position bias (Raffel et al. 2020) — learned per-head additive bias on attention logits, indexed by bucketed relative distance |
+
+The T5 relative bias uses logarithmic distance bucketing: nearby positions get individual buckets while distant positions share log-spaced buckets. This is injected as an additive mask into PyTorch's standard `nn.MultiheadAttention`, requiring no custom attention code. Bucket count and max distance are configurable via `--t5-num-buckets` and `--t5-max-distance`.
+
 ### Training
 
 ```bash
 python masked_model.py --epochs 500                    # baseline (4 layers, 512 window)
-python masked_model_gpu.py --epochs 500 --n-layers 7 \ # GPU-optimised (7 layers, 1024 window)
+python masked_model_gpu.py --epochs 500 --n-layers 7 \ # GPU-optimised, sinusoidal PE
     --seq-len 1024 --stride 64 --mask-patch-min 8 --mask-patch-max 128
+python masked_model_gpu.py --epochs 500 --n-layers 7 \ # GPU-optimised, T5 relative bias
+    --seq-len 1024 --stride 64 --mask-patch-min 8 --mask-patch-max 128 \
+    --pos-encoding t5 --t5-num-buckets 64 --t5-max-distance 1024
 ```
 
 The model uses AdamW with linear warmup (20 epochs) followed by cosine decay. The GPU-optimised version (`masked_model_gpu.py`) adds BF16 mixed precision, `torch.compile`, and multi-worker data loading.
@@ -175,6 +187,48 @@ Despite the heavy geometric overlap, the model reaches nearly the same val MSE (
 - **Layers 2–3** compress more aggressively (LB k=30: 6–7 vs 10–11) — the model quickly discovers the signal lives in a low-dimensional subspace.
 - **Layer 7** and **Output** retain slightly higher dimensionality (2.8 and 1.6 vs 2.6 and 1.2 at k=30) — the model needs more structure to disambiguate overlapping circles than when they occupy orthogonal planes.
 - The model successfully uses **temporal context** (angular velocity differences, transition patterns) to separate circles that are geometrically inseparable in any single time step.
+
+### 7-Layer model with T5 relative position bias (subspace_dim=20)
+
+Same architecture and data as the first sinusoidal model above, but replacing the absolute sinusoidal positional encoding with **T5-style learned relative position bias** (64 buckets, max distance 1024). The relative bias is applied as an additive per-head mask on the attention logits — each head learns its own distance-dependent attention pattern.
+
+**Data:** 200k steps, 10 circles in full 20D ambient space (subspace_dim=20, no geometric overlap), noise_std=2.83 (SNR ≈ 2.5).
+
+**Training:** 7 transformer layers, 1.47M parameters, 1024-step windows, stochastic mask patches (8–128 steps), stride 64, BF16 mixed precision. Best val MSE: **8.03** (noise floor ≈ 8.0).
+
+```bash
+python masked_model_gpu.py --epochs 500 --n-layers 7 --stride 64 \
+    --mask-patch-min 8 --mask-patch-max 128 --seq-len 1024 --no-train-eval \
+    --pos-encoding t5 --t5-num-buckets 64 --t5-max-distance 1024
+```
+
+#### Training dynamics: T5 vs sinusoidal
+
+The T5 model converges noticeably faster and more smoothly than the sinusoidal baseline.
+
+| | Sinusoidal | T5 relative bias |
+|---|---|---|
+| **Training loss curve** | ![Sinusoidal training](training_loss1.png) | ![T5 training](training_loss_t5.png) |
+
+With sinusoidal positional encoding, the loss curve shows a **plateau around epochs 80–130** before a second phase of rapid descent — the model appears to pass through a more entangled intermediate state before finding a good representation. With T5 relative bias, the descent is **monotonic and smooth**, reaching the noise floor by ~epoch 100 without any visible plateau. This suggests that learned relative position biases provide a more direct inductive bias for this task: instead of needing to first disentangle absolute position information from the signal, the model can focus on relative temporal relationships from the start.
+
+#### Learned representations (T5)
+
+![7-Layer Representation UMAP — T5](representation_umap_7layer_1024_t5.png)
+
+| Layer | k=10 | k=30 | k=100 |
+|---|---|---|---|
+| Input (20D) | 14.1 | 11.4 | 8.9 |
+| Layer 1 | 10.5 | 7.4 | 5.3 |
+| Layer 2 | 8.7 | 6.8 | 5.8 |
+| Layer 3 | 7.7 | 6.1 | 6.0 |
+| Layer 4 | 7.1 | 5.4 | 5.5 |
+| Layer 5 | 6.7 | 4.7 | 4.4 |
+| Layer 6 | 6.1 | 3.7 | 3.3 |
+| Layer 7 | 5.2 | 2.5 | 2.8 |
+| Output (20D) | 1.7 | 1.6 | 2.1 |
+
+Compared to the sinusoidal model, the T5 representations show **smooth, monotonic dimension reduction from Layer 1 onward** — there is no initial dimensionality expansion at Layer 1 (LB k=30: 7.4 for T5 vs 12.4 for sinusoidal). The model passes through a less entangled state in the early layers, consistent with the smoother training dynamics. By the final layers, both models converge to similar intrinsic dimensions (~2.5 at k=30), confirming that the T5 model finds an equally compact representation of the circular manifolds while taking a more direct path to get there.
 
 ## Scripts
 

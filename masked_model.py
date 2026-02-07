@@ -64,6 +64,66 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+# ---------------------------------------------------------------------------
+# T5-style relative position bias  (Raffel et al. 2020)
+# ---------------------------------------------------------------------------
+
+def _relative_position_bucket(relative_position, bidirectional=True,
+                               num_buckets=32, max_distance=128):
+    """
+    Map relative position (key_pos - query_pos) to a bucket index.
+
+    Uses the T5 bucketing scheme: exact buckets for small distances,
+    logarithmically-spaced buckets for larger distances.
+    """
+    relative_buckets = torch.zeros_like(relative_position)
+    if bidirectional:
+        num_buckets //= 2
+        relative_buckets += (relative_position > 0).long() * num_buckets
+        relative_position = torch.abs(relative_position)
+    else:
+        relative_position = -torch.min(
+            relative_position, torch.zeros_like(relative_position))
+
+    max_exact = num_buckets // 2
+    is_small = relative_position < max_exact
+
+    relative_position_if_large = max_exact + (
+        torch.log(relative_position.float() / max_exact)
+        / math.log(max_distance / max_exact)
+        * (num_buckets - max_exact)
+    ).to(torch.long)
+    relative_position_if_large = torch.min(
+        relative_position_if_large,
+        torch.full_like(relative_position_if_large, num_buckets - 1),
+    )
+
+    relative_buckets += torch.where(
+        is_small, relative_position, relative_position_if_large)
+    return relative_buckets
+
+
+class T5RelativePositionBias(nn.Module):
+    """Learned relative position bias (T5 / mT5 style)."""
+
+    def __init__(self, n_heads, num_buckets=32, max_distance=128):
+        super().__init__()
+        self.n_heads = n_heads
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.relative_attention_bias = nn.Embedding(num_buckets, n_heads)
+
+    def forward(self, seq_len):
+        device = self.relative_attention_bias.weight.device
+        positions = torch.arange(seq_len, dtype=torch.long, device=device)
+        relative_position = positions.unsqueeze(0) - positions.unsqueeze(1)
+        buckets = _relative_position_bucket(
+            relative_position, bidirectional=True,
+            num_buckets=self.num_buckets, max_distance=self.max_distance)
+        values = self.relative_attention_bias(buckets)
+        return values.permute(2, 0, 1).contiguous()
+
+
 class MaskedTimeSeriesBERT(nn.Module):
     """
     BERT-style masked prediction model for continuous time series.
@@ -95,10 +155,15 @@ class MaskedTimeSeriesBERT(nn.Module):
         d_ff=512,
         dropout=0.1,
         max_len=2048,
+        pos_encoding='sinusoidal',
+        t5_num_buckets=32,
+        t5_max_distance=128,
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.d_model = d_model
+        self.n_heads = n_heads
+        self.pos_encoding = pos_encoding
 
         # Learnable mask embedding (replaces masked positions before projection)
         self.mask_token = nn.Parameter(torch.randn(feature_dim))
@@ -107,7 +172,20 @@ class MaskedTimeSeriesBERT(nn.Module):
         self.input_proj = nn.Linear(feature_dim, d_model)
 
         # Positional encoding
-        self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len, dropout)
+        if pos_encoding == 'sinusoidal':
+            self.pos_enc = SinusoidalPositionalEncoding(
+                d_model, max_len, dropout)
+        elif pos_encoding == 't5':
+            self.input_dropout = nn.Dropout(p=dropout)
+            self.rel_pos_bias = T5RelativePositionBias(
+                n_heads=n_heads,
+                num_buckets=t5_num_buckets,
+                max_distance=t5_max_distance,
+            )
+        else:
+            raise ValueError(
+                f"Unknown pos_encoding '{pos_encoding}'. "
+                f"Choose from: sinusoidal, t5")
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -129,6 +207,16 @@ class MaskedTimeSeriesBERT(nn.Module):
             nn.Linear(d_ff, feature_dim),
         )
 
+    # -- helpers for T5 bias --------------------------------------------------
+
+    def _get_t5_attn_mask(self, batch_size, seq_len):
+        """Build per-head relative position bias for nn.MultiheadAttention."""
+        bias = self.rel_pos_bias(seq_len)
+        bias = bias.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        return bias.reshape(batch_size * self.n_heads, seq_len, seq_len)
+
+    # -- forward & encode -----------------------------------------------------
+
     def forward(self, x, mask):
         """
         Parameters
@@ -147,11 +235,13 @@ class MaskedTimeSeriesBERT(nn.Module):
         # Project to transformer dimension
         h = self.input_proj(x_masked)
 
-        # Add positional encoding
-        h = self.pos_enc(h)
-
-        # Transformer encoder (self-attention over the full sequence)
-        h = self.transformer(h)
+        if self.pos_encoding == 'sinusoidal':
+            h = self.pos_enc(h)
+            h = self.transformer(h)
+        else:  # t5
+            h = self.input_dropout(h)
+            attn_mask = self._get_t5_attn_mask(h.size(0), h.size(1))
+            h = self.transformer(h, mask=attn_mask)
 
         # Project back to feature space
         pred = self.output_proj(h)
@@ -177,12 +267,30 @@ class MaskedTimeSeriesBERT(nn.Module):
               after the output projection head (the reconstruction).
         """
         h = self.input_proj(x)
-        h = self.pos_enc(h)
+
+        if self.pos_encoding == 'sinusoidal':
+            h = self.pos_enc(h)
+            attn_mask = None
+        else:  # t5
+            h = self.input_dropout(h)
+            attn_mask = self._get_t5_attn_mask(h.size(0), h.size(1))
+
+        # NOTE: PyTorch's TransformerEncoderLayer has an inference-mode
+        # "fast path" that mishandles 3D additive attention masks on GPU,
+        # producing NaN.  Temporarily switching to train() mode disables
+        # this fast path while keeping identical results (dropout is
+        # already 0 at eval time).
+        need_train_mode = (attn_mask is not None and not self.training)
+        if need_train_mode:
+            self.transformer.train()
 
         layer_outputs = []
         for layer in self.transformer.layers:
-            h = layer(h)
+            h = layer(h, src_mask=attn_mask)
             layer_outputs.append(h)
+
+        if need_train_mode:
+            self.transformer.eval()
 
         # Output projection (denoised reconstruction)
         layer_outputs.append(self.output_proj(h))

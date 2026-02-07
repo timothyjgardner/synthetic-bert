@@ -64,6 +64,92 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+# ---------------------------------------------------------------------------
+# T5-style relative position bias  (Raffel et al. 2020)
+# ---------------------------------------------------------------------------
+
+def _relative_position_bucket(relative_position, bidirectional=True,
+                               num_buckets=32, max_distance=128):
+    """
+    Map relative position (key_pos - query_pos) to a bucket index.
+
+    Uses the T5 bucketing scheme: exact buckets for small distances,
+    logarithmically-spaced buckets for larger distances.
+    """
+    relative_buckets = torch.zeros_like(relative_position)
+    if bidirectional:
+        num_buckets //= 2
+        # Positive vs negative direction gets separate bucket ranges
+        relative_buckets += (relative_position > 0).long() * num_buckets
+        relative_position = torch.abs(relative_position)
+    else:
+        relative_position = -torch.min(
+            relative_position, torch.zeros_like(relative_position))
+
+    # First half of buckets: exact distances [0, max_exact)
+    max_exact = num_buckets // 2
+    is_small = relative_position < max_exact
+
+    # Second half: log-spaced bins up to max_distance
+    relative_position_if_large = max_exact + (
+        torch.log(relative_position.float() / max_exact)
+        / math.log(max_distance / max_exact)
+        * (num_buckets - max_exact)
+    ).to(torch.long)
+    relative_position_if_large = torch.min(
+        relative_position_if_large,
+        torch.full_like(relative_position_if_large, num_buckets - 1),
+    )
+
+    relative_buckets += torch.where(
+        is_small, relative_position, relative_position_if_large)
+    return relative_buckets
+
+
+class T5RelativePositionBias(nn.Module):
+    """
+    Learned relative position bias (T5 / mT5 style).
+
+    Produces an additive bias of shape ``(n_heads, S, S)`` that is added
+    to the attention logits via the ``attn_mask`` argument of
+    ``nn.MultiheadAttention``.
+
+    Parameters
+    ----------
+    n_heads : int
+        Number of attention heads.
+    num_buckets : int
+        Total number of relative-position buckets (32 is the T5 default).
+    max_distance : int
+        Distances beyond this are clamped to the last bucket.
+    """
+
+    def __init__(self, n_heads, num_buckets=32, max_distance=128):
+        super().__init__()
+        self.n_heads = n_heads
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.relative_attention_bias = nn.Embedding(num_buckets, n_heads)
+
+    def forward(self, seq_len):
+        """Return bias tensor of shape ``(n_heads, seq_len, seq_len)``."""
+        device = self.relative_attention_bias.weight.device
+        positions = torch.arange(seq_len, dtype=torch.long, device=device)
+        # relative_position[i, j] = j - i
+        relative_position = positions.unsqueeze(0) - positions.unsqueeze(1)
+
+        buckets = _relative_position_bucket(
+            relative_position,
+            bidirectional=True,
+            num_buckets=self.num_buckets,
+            max_distance=self.max_distance,
+        )
+
+        # (seq_len, seq_len) → (seq_len, seq_len, n_heads) → (n_heads, S, S)
+        values = self.relative_attention_bias(buckets)
+        return values.permute(2, 0, 1).contiguous()
+
+
 class MaskedTimeSeriesBERT(nn.Module):
     """
     BERT-style masked prediction model for continuous time series.
@@ -84,6 +170,13 @@ class MaskedTimeSeriesBERT(nn.Module):
         Dropout rate.
     max_len : int
         Maximum sequence length.
+    pos_encoding : str
+        Positional encoding scheme: ``'sinusoidal'`` (absolute, Vaswani 2017)
+        or ``'t5'`` (learned relative bias, Raffel 2020).
+    t5_num_buckets : int
+        Number of relative-position buckets (only used when pos_encoding='t5').
+    t5_max_distance : int
+        Maximum distance for bucketing (only used when pos_encoding='t5').
     """
 
     def __init__(
@@ -95,10 +188,15 @@ class MaskedTimeSeriesBERT(nn.Module):
         d_ff=512,
         dropout=0.1,
         max_len=2048,
+        pos_encoding='sinusoidal',
+        t5_num_buckets=32,
+        t5_max_distance=128,
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.d_model = d_model
+        self.n_heads = n_heads
+        self.pos_encoding = pos_encoding
 
         # Learnable mask embedding (replaces masked positions before projection)
         self.mask_token = nn.Parameter(torch.randn(feature_dim))
@@ -107,7 +205,21 @@ class MaskedTimeSeriesBERT(nn.Module):
         self.input_proj = nn.Linear(feature_dim, d_model)
 
         # Positional encoding
-        self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len, dropout)
+        if pos_encoding == 'sinusoidal':
+            self.pos_enc = SinusoidalPositionalEncoding(
+                d_model, max_len, dropout)
+        elif pos_encoding == 't5':
+            # No additive PE — position info comes from attention bias
+            self.input_dropout = nn.Dropout(p=dropout)
+            self.rel_pos_bias = T5RelativePositionBias(
+                n_heads=n_heads,
+                num_buckets=t5_num_buckets,
+                max_distance=t5_max_distance,
+            )
+        else:
+            raise ValueError(
+                f"Unknown pos_encoding '{pos_encoding}'. "
+                f"Choose from: sinusoidal, t5")
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -129,6 +241,20 @@ class MaskedTimeSeriesBERT(nn.Module):
             nn.Linear(d_ff, feature_dim),
         )
 
+    # -- helpers for T5 bias --------------------------------------------------
+
+    def _get_t5_attn_mask(self, batch_size, seq_len):
+        """Build per-head relative position bias for nn.MultiheadAttention.
+
+        Returns ``(batch_size * n_heads, seq_len, seq_len)`` additive mask.
+        """
+        bias = self.rel_pos_bias(seq_len)           # (n_heads, S, S)
+        # Expand to (B, n_heads, S, S) then flatten first two dims
+        bias = bias.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        return bias.reshape(batch_size * self.n_heads, seq_len, seq_len)
+
+    # -- forward & encode -----------------------------------------------------
+
     def forward(self, x, mask):
         """
         Parameters
@@ -148,11 +274,13 @@ class MaskedTimeSeriesBERT(nn.Module):
         # Project to transformer dimension
         h = self.input_proj(x_masked)
 
-        # Add positional encoding
-        h = self.pos_enc(h)
-
-        # Transformer encoder (self-attention over the full sequence)
-        h = self.transformer(h)
+        if self.pos_encoding == 'sinusoidal':
+            h = self.pos_enc(h)
+            h = self.transformer(h)
+        else:  # t5
+            h = self.input_dropout(h)
+            attn_mask = self._get_t5_attn_mask(h.size(0), h.size(1))
+            h = self.transformer(h, mask=attn_mask)
 
         # Project back to feature space
         pred = self.output_proj(h)
@@ -178,12 +306,30 @@ class MaskedTimeSeriesBERT(nn.Module):
               after the output projection head (the reconstruction).
         """
         h = self.input_proj(x)
-        h = self.pos_enc(h)
+
+        if self.pos_encoding == 'sinusoidal':
+            h = self.pos_enc(h)
+            attn_mask = None
+        else:  # t5
+            h = self.input_dropout(h)
+            attn_mask = self._get_t5_attn_mask(h.size(0), h.size(1))
+
+        # NOTE: PyTorch's TransformerEncoderLayer has an inference-mode
+        # "fast path" that mishandles 3D additive attention masks on GPU,
+        # producing NaN.  Temporarily switching to train() mode disables
+        # this fast path while keeping identical results (dropout is
+        # already 0 at eval time).
+        need_train_mode = (attn_mask is not None and not self.training)
+        if need_train_mode:
+            self.transformer.train()
 
         layer_outputs = []
         for layer in self.transformer.layers:
-            h = layer(h)
+            h = layer(h, src_mask=attn_mask)
             layer_outputs.append(h)
+
+        if need_train_mode:
+            self.transformer.eval()
 
         # Output projection (denoised reconstruction)
         layer_outputs.append(self.output_proj(h))
@@ -450,6 +596,14 @@ def main():
                         help='Feed-forward hidden dimension')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate')
+    parser.add_argument('--pos-encoding', type=str, default='sinusoidal',
+                        choices=['sinusoidal', 't5'],
+                        help='Positional encoding: sinusoidal (absolute) '
+                             'or t5 (learned relative bias)')
+    parser.add_argument('--t5-num-buckets', type=int, default=32,
+                        help='Number of relative-position buckets for T5 bias')
+    parser.add_argument('--t5-max-distance', type=int, default=128,
+                        help='Max distance for T5 relative-position bucketing')
     # Training
     parser.add_argument('--batch-size', type=int, default=128,
                         help='Training batch size (default 128 for 32GB VRAM)')
@@ -567,12 +721,15 @@ def main():
         d_ff=args.d_ff,
         dropout=args.dropout,
         max_len=args.seq_len + 64,
+        pos_encoding=args.pos_encoding,
+        t5_num_buckets=args.t5_num_buckets,
+        t5_max_distance=args.t5_max_distance,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {n_params:,} parameters  "
           f"(d_model={args.d_model}, layers={args.n_layers}, "
-          f"heads={args.n_heads})")
+          f"heads={args.n_heads}, pos={args.pos_encoding})")
 
     # ---- torch.compile (inductor backend) ----
     if not args.no_compile and device.type == 'cuda':
